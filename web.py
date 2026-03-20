@@ -19,6 +19,7 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
 
 
 # ── Job management ────────────────────────────────────────────────────
@@ -382,12 +383,15 @@ def api_import():
     if not records:
         return jsonify(error="No records provided"), 400
 
+    # Default to higher concurrency for bulk imports
+    default_concurrency = min(10, max(3, len(records) // 10))
+
     job = _create_job(
         mode="import", record_count=len(records),
         stealth=data.get("stealth", True),
         deep_crawl=data.get("deep_crawl", False),
         proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", 3)),
+        concurrency=int(data.get("concurrency", default_concurrency)),
     )
 
     thread = threading.Thread(

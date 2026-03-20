@@ -1020,35 +1020,45 @@ async def scrape_all(
     on_progress: ProgressCallback = None,
     config: ScrapeConfig | None = None,
 ) -> list[dict]:
+    """Scrape all URLs with no limit. Processes in batches to manage memory."""
     config = config or ScrapeConfig()
     browser_cfg = config.make_browser_config()
-    results: list[dict | None] = [None] * len(urls)
     total = len(urls)
-    sem = asyncio.Semaphore(config.concurrency)
+    all_results: list[dict] = []
     rate_limiter = DomainRateLimiter(min_delay=2.0)
     counter = {"done": 0}
     lock = asyncio.Lock()
 
-    async def _task(idx: int, url: str):
-        async with sem:
-            lead = await scrape_lead(
-                url, crawler,
-                rate_limiter=rate_limiter,
-                timeout=config.timeout,
-                crawl_depth=config.crawl_depth,
-            )
-            results[idx] = lead
-            async with lock:
-                counter["done"] += 1
-                if on_progress:
-                    on_progress(counter["done"], total,
-                                f"Scraping {counter['done']}/{total}: {url[:60]}...")
+    # Process in batches to avoid memory blowup on large imports
+    batch_size = max(50, config.concurrency * 10)
 
-    async with AsyncWebCrawler(config=browser_cfg) as crawler:
-        tasks = [_task(i, url) for i, url in enumerate(urls)]
-        await asyncio.gather(*tasks)
+    for batch_start in range(0, total, batch_size):
+        batch_urls = urls[batch_start:batch_start + batch_size]
+        batch_results: list[dict | None] = [None] * len(batch_urls)
+        sem = asyncio.Semaphore(config.concurrency)
 
-    return [r for r in results if r is not None]
+        async def _task(idx: int, url: str):
+            async with sem:
+                lead = await scrape_lead(
+                    url, crawler,
+                    rate_limiter=rate_limiter,
+                    timeout=config.timeout,
+                    crawl_depth=config.crawl_depth,
+                )
+                batch_results[idx] = lead
+                async with lock:
+                    counter["done"] += 1
+                    if on_progress:
+                        on_progress(counter["done"], total,
+                                    f"Scraping {counter['done']}/{total}: {url[:60]}...")
+
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            tasks = [_task(i, url) for i, url in enumerate(batch_urls)]
+            await asyncio.gather(*tasks)
+
+        all_results.extend(r for r in batch_results if r is not None)
+
+    return all_results
 
 
 # ── Sub-page & deep crawling ──────────────────────────────────────────
