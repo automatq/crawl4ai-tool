@@ -380,11 +380,16 @@ def api_scrape():
 def api_import():
     data = request.get_json(force=True)
 
-    # Accept both {"records": [...]} and a raw array [...]
+    # Accept {"records": [...]}, a raw array [...], or a single record {...}
     if isinstance(data, list):
         records = data
-    else:
+    elif isinstance(data, dict) and "records" in data:
         records = data.get("records", [])
+    elif isinstance(data, dict) and ("website" in data or "url" in data):
+        # Single record from n8n (sends one item per request)
+        records = [data]
+    else:
+        records = []
 
     if not records:
         return jsonify(error="No records provided"), 400
