@@ -1,0 +1,34 @@
+{
+  "name": "n8n-nodes-lead-scraper",
+  "version": "1.0.0",
+  "description": "n8n node for Lead Scraper — scrape business websites for emails, phones, and contact data",
+  "keywords": ["n8n", "n8n-community-node-package", "lead-generation", "scraping", "crawl4ai"],
+  "license": "MIT",
+  "author": {
+    "name": "Lead Scraper"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "dist/nodes/LeadScraper/LeadScraper.node.js"
+    ],
+    "credentials": [
+      "dist/credentials/LeadScraperApi.credentials.js"
+    ]
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint . --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "n8n-workflow": "^1.0.0",
+    "typescript": "^5.0.0"
+  }
+}

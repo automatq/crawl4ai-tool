@@ -1,0 +1,258 @@
+{
+  "name": "Lead Scraper — Import & Enrich",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger",
+      "name": "When clicking 'Test workflow'",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "base_url",
+              "name": "base_url",
+              "value": "http://localhost:5000",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "notesInFlow": true,
+      "notes": "Set base_url to your Lead Scraper instance.\nUse ngrok URL for n8n Cloud."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.base_url }}/api/import",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ records: $('Google Maps Data').all().map(i => i.json), stealth: true, deep_crawl: true }) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "start_import",
+      "name": "Start Import Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "id": "wait_initial",
+      "name": "Wait 10s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Config').item.json.base_url }}/api/results/{{ $('Start Import Job').item.json.job_id }}",
+        "options": {}
+      },
+      "id": "check_status",
+      "name": "Check Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "done_check",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is_done",
+      "name": "Done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1100, 0]
+    },
+    {
+      "parameters": {
+        "amount": 15,
+        "unit": "seconds"
+      },
+      "id": "wait_poll",
+      "name": "Wait 15s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "leads",
+        "options": {}
+      },
+      "id": "split_leads",
+      "name": "Split Leads",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [1320, -100]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "company",
+              "name": "company",
+              "value": "={{ $json.company }}",
+              "type": "string"
+            },
+            {
+              "id": "url",
+              "name": "url",
+              "value": "={{ $json.url }}",
+              "type": "string"
+            },
+            {
+              "id": "emails",
+              "name": "emails",
+              "value": "={{ ($json.emails || []).join('; ') }}",
+              "type": "string"
+            },
+            {
+              "id": "phones",
+              "name": "phones",
+              "value": "={{ ($json.phones || []).join('; ') }}",
+              "type": "string"
+            },
+            {
+              "id": "address",
+              "name": "address",
+              "value": "={{ $json.address || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "hours",
+              "name": "hours",
+              "value": "={{ $json.hours || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "category",
+              "name": "category",
+              "value": "={{ $json.category || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "rating",
+              "name": "rating",
+              "value": "={{ $json.rating || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "neighborhood",
+              "name": "neighborhood",
+              "value": "={{ $json.neighborhood || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "socials",
+              "name": "socials",
+              "value": "={{ JSON.stringify($json.socials || {}) }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "format_output",
+      "name": "Format Output",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1540, -100],
+      "notesInFlow": true,
+      "notes": "Each lead is a separate item.\nConnect to Google Sheets, Slack, CRM, etc."
+    }
+  ],
+  "connections": {
+    "When clicking 'Test workflow'": {
+      "main": [[{ "node": "Google Maps Data", "type": "main", "index": 0 }]]
+    },
+    "Google Maps Data": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "Start Import Job", "type": "main", "index": 0 }]]
+    },
+    "Start Import Job": {
+      "main": [[{ "node": "Wait 10s", "type": "main", "index": 0 }]]
+    },
+    "Wait 10s": {
+      "main": [[{ "node": "Check Status", "type": "main", "index": 0 }]]
+    },
+    "Check Status": {
+      "main": [[{ "node": "Done?", "type": "main", "index": 0 }]]
+    },
+    "Done?": {
+      "main": [
+        [{ "node": "Split Leads", "type": "main", "index": 0 }],
+        [{ "node": "Wait 15s", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait 15s": {
+      "main": [[{ "node": "Check Status", "type": "main", "index": 0 }]]
+    },
+    "Split Leads": {
+      "main": [[{ "node": "Format Output", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {
+    "Google Maps Data": [
+      {
+        "json": {
+          "type": "place",
+          "title": "Reliance Heating, Air Conditioning & Plumbing",
+          "address": "145 Front St E Suite L3, Toronto, ON M5A 1E3, Canada",
+          "neighborhood": "Old Toronto",
+          "street": "145 Front St E Suite L3",
+          "postalCode": "M5A 1E3",
+          "city": "Ontario",
+          "website": "https://reliancehomecomfort.com/toronto/",
+          "phone": "(888) 431-3111",
+          "totalScore": 4.7,
+          "categoryName": "HVAC contractor"
+        }
+      }
+    ]
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": []
+}

@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lead Scraper</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <svg class="logo-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+      </svg>
+      <h1>Lead Scraper</h1>
+    </div>
+    <div class="topbar-right">
+      <span id="run-id" class="run-id" hidden>Run <code id="run-id-value"></code></span>
+      <span id="status-badge" class="badge badge-idle">Idle</span>
+    </div>
+  </header>
+
+  <!-- Main tabs -->
+  <nav class="tab-bar">
+    <button class="tab active" data-tab="input">Input</button>
+    <button class="tab" data-tab="run">Run</button>
+    <button class="tab" data-tab="dataset">Dataset</button>
+  </nav>
+
+  <main>
+
+    <!-- ── INPUT TAB ──────────────────────────────────────────── -->
+    <section id="panel-input" class="panel">
+
+      <div class="input-mode-toggle">
+        <button class="mode-btn active" data-mode="keyword">Keyword Search</button>
+        <button class="mode-btn" data-mode="url">Direct URL</button>
+        <button class="mode-btn" data-mode="import">Import File</button>
+      </div>
+
+      <!-- Keyword form -->
+      <div id="keyword-fields" class="form-section">
+        <div class="field">
+          <label for="keyword">Business keyword</label>
+          <input type="text" id="keyword" placeholder='e.g. "hvac", "dentist", "plumber"'>
+          <small>The type of business to search for</small>
+        </div>
+        <div class="field">
+          <label for="cities">Cities</label>
+          <input type="text" id="cities" placeholder='e.g. "Denver, Phoenix, Dallas"'>
+          <small>Comma-separated list of cities to search in</small>
+        </div>
+        <div class="field field-sm">
+          <label for="num-results">Max leads</label>
+          <input type="number" id="num-results" value="50" min="1" max="500">
+          <small>Maximum number of leads to collect</small>
+        </div>
+      </div>
+
+      <!-- URL form -->
+      <div id="url-fields" class="form-section" hidden>
+        <div class="field">
+          <label for="direct-url">URL to scrape</label>
+          <input type="text" id="direct-url" placeholder="https://example.com">
+          <small>Directly scrape a single website for contact info</small>
+        </div>
+      </div>
+
+      <!-- Import file form -->
+      <div id="import-fields" class="form-section" hidden>
+        <div class="field">
+          <label for="import-file">Upload JSON file</label>
+          <div class="file-drop" id="file-drop">
+            <input type="file" id="import-file" accept=".json" hidden>
+            <p class="file-drop-text">Drop a JSON file here or <a href="#" id="file-browse">browse</a></p>
+            <p id="file-name" class="file-name" hidden></p>
+          </div>
+          <small>Accepts JSON from Google Maps scrapers, Apify, or any tool — extracts <code>website</code> or <code>url</code> fields and scrapes each one for contact data</small>
+        </div>
+      </div>
+
+      <!-- Advanced options -->
+      <details class="advanced-toggle">
+        <summary>Advanced options</summary>
+        <div class="advanced-options">
+          <div class="option-row">
+            <label class="toggle-label">
+              <input type="checkbox" id="opt-stealth" checked>
+              <span>Stealth mode</span>
+            </label>
+            <small>Randomize browser fingerprint to avoid detection</small>
+          </div>
+          <div class="option-row">
+            <label class="toggle-label">
+              <input type="checkbox" id="opt-google-maps">
+              <span>Google Maps search</span>
+            </label>
+            <small>Also search Google Maps for business listings</small>
+          </div>
+          <div class="option-row">
+            <label class="toggle-label">
+              <input type="checkbox" id="opt-deep-crawl">
+              <span>Deep crawl</span>
+            </label>
+            <small>Follow internal links (contact, about, team pages) for more data</small>
+          </div>
+          <div class="field field-sm">
+            <label for="opt-concurrency">Concurrency</label>
+            <input type="number" id="opt-concurrency" value="3" min="1" max="10">
+            <small>Parallel scrapers (higher = faster but more resource use)</small>
+          </div>
+          <div class="field">
+            <label for="opt-proxies">Proxies <span class="optional-tag">optional</span></label>
+            <textarea id="opt-proxies" rows="3" placeholder="http://proxy1:8080&#10;http://user:pass@proxy2:8080&#10;One per line"></textarea>
+            <small>Rotate through proxy servers to avoid IP blocks</small>
+          </div>
+        </div>
+      </details>
+
+      <div class="form-actions">
+        <button id="start-btn" class="btn btn-primary">Start</button>
+      </div>
+    </section>
+
+    <!-- ── RUN TAB ────────────────────────────────────────────── -->
+    <section id="panel-run" class="panel" hidden>
+
+      <!-- Run info bar -->
+      <div class="run-info-bar">
+        <div class="run-stat">
+          <span class="run-stat-label">Status</span>
+          <span id="run-status" class="badge badge-idle">Pending</span>
+        </div>
+        <div class="run-stat">
+          <span class="run-stat-label">Duration</span>
+          <span id="run-duration">0s</span>
+        </div>
+        <div class="run-stat">
+          <span class="run-stat-label">Results</span>
+          <span id="run-count">0</span>
+        </div>
+        <div class="run-actions">
+          <button id="cancel-btn" class="btn btn-outline btn-sm" hidden>Cancel</button>
+        </div>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-section">
+        <div class="progress-track">
+          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <span id="progress-pct" class="progress-pct">0%</span>
+      </div>
+
+      <!-- Live logs -->
+      <div class="logs-section">
+        <div class="logs-header">
+          <span>Log</span>
+        </div>
+        <div id="logs-container" class="logs-container">
+          <div class="log-empty">Run a scrape to see logs here.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── DATASET TAB ────────────────────────────────────────── -->
+    <section id="panel-dataset" class="panel" hidden>
+
+      <div class="dataset-toolbar">
+        <div class="dataset-toolbar-left">
+          <input type="search" id="filter-input" placeholder="Filter results..." class="filter-input">
+          <span id="results-count" class="results-count"></span>
+        </div>
+        <div class="dataset-toolbar-right">
+          <button id="copy-emails-btn" class="btn btn-outline btn-sm">Copy Emails</button>
+          <button id="export-csv-btn" class="btn btn-outline btn-sm">CSV</button>
+          <button id="export-json-btn" class="btn btn-outline btn-sm">JSON</button>
+        </div>
+      </div>
+
+      <div class="dataset-empty" id="dataset-empty">
+        <p>No data yet. Run a scrape from the <strong>Input</strong> tab.</p>
+      </div>
+
+      <div class="table-wrap" id="table-wrap" hidden>
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th data-col="company" class="sortable">Company</th>
+              <th data-col="url" class="sortable">URL</th>
+              <th data-col="emails" class="sortable">Emails</th>
+              <th data-col="phones" class="sortable">Phones</th>
+              <th data-col="address" class="sortable">Address</th>
+              <th data-col="hours" class="sortable">Hours</th>
+              <th data-col="socials">Socials</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
