@@ -379,19 +379,28 @@ def api_scrape():
 @app.post("/api/import")
 def api_import():
     data = request.get_json(force=True)
-    records = data.get("records", [])
+
+    # Accept both {"records": [...]} and a raw array [...]
+    if isinstance(data, list):
+        records = data
+    else:
+        records = data.get("records", [])
+
     if not records:
         return jsonify(error="No records provided"), 400
 
     # Default to higher concurrency for bulk imports
     default_concurrency = min(10, max(3, len(records) // 10))
 
+    # If raw array was sent, use defaults for config
+    opts = {} if isinstance(data, list) else data
+
     job = _create_job(
         mode="import", record_count=len(records),
-        stealth=data.get("stealth", True),
-        deep_crawl=data.get("deep_crawl", False),
-        proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", default_concurrency)),
+        stealth=opts.get("stealth", True),
+        deep_crawl=opts.get("deep_crawl", True),
+        proxies=opts.get("proxies", ""),
+        concurrency=int(opts.get("concurrency", default_concurrency)),
     )
 
     thread = threading.Thread(
