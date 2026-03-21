@@ -55,18 +55,28 @@ class Job:
 
 jobs: dict[str, Job] = {}
 
-# Limit concurrent browser jobs to prevent OOM (8GB = ~20 browsers)
-MAX_ACTIVE_JOBS = 10
-_job_semaphore = threading.Semaphore(MAX_ACTIVE_JOBS)
+# Worker pool — fixed number of threads pulling from a shared queue
+import queue
+
+_work_queue: queue.Queue = queue.Queue()
+_NUM_WORKERS = 5  # 5 parallel browsers, safe for 8GB
 
 
-def _run_with_semaphore(func, *args):
-    """Run a job function with semaphore to limit concurrency."""
-    _job_semaphore.acquire()
-    try:
-        func(*args)
-    finally:
-        _job_semaphore.release()
+def _worker():
+    """Worker thread — pulls jobs from queue and runs them."""
+    while True:
+        func, args = _work_queue.get()
+        try:
+            func(*args)
+        except Exception:
+            pass
+        _work_queue.task_done()
+
+
+# Start worker threads once at import time
+for _i in range(_NUM_WORKERS):
+    _t = threading.Thread(target=_worker, daemon=True)
+    _t.start()
 
 
 def _cleanup_old_jobs():
@@ -359,7 +369,7 @@ def api_search():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    threading.Thread(target=_run_with_semaphore, args=(_run_keyword_job, job, keyword, cities, num), daemon=True).start()
+    _work_queue.put((_run_keyword_job, (job, keyword, cities, num)))
     return jsonify(job_id=job.id)
 
 
@@ -379,7 +389,7 @@ def api_scrape():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    threading.Thread(target=_run_with_semaphore, args=(_run_url_job, job, urls), daemon=True).start()
+    _work_queue.put((_run_url_job, (job, urls)))
     return jsonify(job_id=job.id)
 
 
@@ -415,7 +425,7 @@ def api_import():
         concurrency=int(opts.get("concurrency", default_concurrency)),
     )
 
-    threading.Thread(target=_run_with_semaphore, args=(_run_import_job, job, records), daemon=True).start()
+    _work_queue.put((_run_import_job, (job, records)))
     return jsonify(job_id=job.id)
 
 
