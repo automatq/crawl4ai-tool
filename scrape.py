@@ -69,14 +69,11 @@ class ScrapeConfig:
             headless=True,
             enable_stealth=self.stealth,
             user_agent_mode="random" if self.stealth else "",
-            text_mode=True,       # Skip images — saves ~50% memory
-            light_mode=True,      # Skip CSS/fonts — faster + less memory
+            text_mode=True,       # Skip images — faster
+            light_mode=True,      # Skip CSS/fonts — faster
             extra_args=[
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
-                "--disable-software-rasterizer",
-                "--single-process",
-                "--no-zygote",
             ],
         )
         if self.proxies:

@@ -55,39 +55,18 @@ class Job:
 
 jobs: dict[str, Job] = {}
 
-# Job queue — process one job at a time to prevent OOM
-import queue
-_job_queue: queue.Queue = queue.Queue()
-_worker_running = False
-_worker_lock = threading.Lock()
+# Limit concurrent browser jobs to prevent OOM (8GB = ~20 browsers)
+MAX_ACTIVE_JOBS = 10
+_job_semaphore = threading.Semaphore(MAX_ACTIVE_JOBS)
 
 
-def _job_worker():
-    """Single worker thread that processes jobs one at a time."""
-    while True:
-        try:
-            func, args = _job_queue.get(timeout=60)
-        except queue.Empty:
-            # No jobs for 60s, worker exits (will restart on next job)
-            with _worker_lock:
-                global _worker_running
-                _worker_running = False
-            return
-        try:
-            func(*args)
-        except Exception:
-            pass
-        _job_queue.task_done()
-
-
-def _enqueue_job(func, *args):
-    """Add a job to the queue and ensure the worker is running."""
-    _job_queue.put((func, args))
-    with _worker_lock:
-        global _worker_running
-        if not _worker_running:
-            _worker_running = True
-            threading.Thread(target=_job_worker, daemon=True).start()
+def _run_with_semaphore(func, *args):
+    """Run a job function with semaphore to limit concurrency."""
+    _job_semaphore.acquire()
+    try:
+        func(*args)
+    finally:
+        _job_semaphore.release()
 
 
 def _cleanup_old_jobs():
@@ -380,7 +359,7 @@ def api_search():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    _enqueue_job(_run_keyword_job, job, keyword, cities, num)
+    threading.Thread(target=_run_with_semaphore, args=(_run_keyword_job, job, keyword, cities, num), daemon=True).start()
     return jsonify(job_id=job.id)
 
 
@@ -400,7 +379,7 @@ def api_scrape():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    _enqueue_job(_run_url_job, job, urls)
+    threading.Thread(target=_run_with_semaphore, args=(_run_url_job, job, urls), daemon=True).start()
     return jsonify(job_id=job.id)
 
 
@@ -436,7 +415,7 @@ def api_import():
         concurrency=int(opts.get("concurrency", default_concurrency)),
     )
 
-    _enqueue_job(_run_import_job, job, records)
+    threading.Thread(target=_run_with_semaphore, args=(_run_import_job, job, records), daemon=True).start()
     return jsonify(job_id=job.id)
 
 
