@@ -54,6 +54,8 @@ class Job:
 
 
 jobs: dict[str, Job] = {}
+MAX_ACTIVE_JOBS = 3  # Limit concurrent browser instances to prevent OOM
+_job_semaphore = threading.Semaphore(MAX_ACTIVE_JOBS)
 
 
 def _cleanup_old_jobs():
@@ -171,6 +173,12 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
 
 def _run_import_job(job: Job, records: list[dict]):
     """Scrape URLs from imported data (e.g. Google Maps export) and merge results."""
+    # Wait for a slot — prevents OOM from too many browsers
+    with job.lock:
+        job.status = "pending"
+        job.progress_msg = "Queued, waiting for available slot..."
+    job.log("Waiting for available slot...")
+    _job_semaphore.acquire()
     try:
         cfg = _make_config(job.input_config)
 
@@ -269,6 +277,8 @@ def _run_import_job(job: Job, records: list[dict]):
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
+    finally:
+        _job_semaphore.release()
 
 
 def _run_url_job(job: Job, urls: list[str]):
