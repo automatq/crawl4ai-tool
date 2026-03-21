@@ -54,8 +54,40 @@ class Job:
 
 
 jobs: dict[str, Job] = {}
-MAX_ACTIVE_JOBS = 3  # Limit concurrent browser instances to prevent OOM
-_job_semaphore = threading.Semaphore(MAX_ACTIVE_JOBS)
+
+# Job queue — process one job at a time to prevent OOM
+import queue
+_job_queue: queue.Queue = queue.Queue()
+_worker_running = False
+_worker_lock = threading.Lock()
+
+
+def _job_worker():
+    """Single worker thread that processes jobs one at a time."""
+    while True:
+        try:
+            func, args = _job_queue.get(timeout=60)
+        except queue.Empty:
+            # No jobs for 60s, worker exits (will restart on next job)
+            with _worker_lock:
+                global _worker_running
+                _worker_running = False
+            return
+        try:
+            func(*args)
+        except Exception:
+            pass
+        _job_queue.task_done()
+
+
+def _enqueue_job(func, *args):
+    """Add a job to the queue and ensure the worker is running."""
+    _job_queue.put((func, args))
+    with _worker_lock:
+        global _worker_running
+        if not _worker_running:
+            _worker_running = True
+            threading.Thread(target=_job_worker, daemon=True).start()
 
 
 def _cleanup_old_jobs():
@@ -173,12 +205,6 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
 
 def _run_import_job(job: Job, records: list[dict]):
     """Scrape URLs from imported data (e.g. Google Maps export) and merge results."""
-    # Wait for a slot — prevents OOM from too many browsers
-    with job.lock:
-        job.status = "pending"
-        job.progress_msg = "Queued, waiting for available slot..."
-    job.log("Waiting for available slot...")
-    _job_semaphore.acquire()
     try:
         cfg = _make_config(job.input_config)
 
@@ -277,8 +303,6 @@ def _run_import_job(job: Job, records: list[dict]):
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
-    finally:
-        _job_semaphore.release()
 
 
 def _run_url_job(job: Job, urls: list[str]):
@@ -356,10 +380,7 @@ def api_search():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    thread = threading.Thread(
-        target=_run_keyword_job, args=(job, keyword, cities, num), daemon=True
-    )
-    thread.start()
+    _enqueue_job(_run_keyword_job, job, keyword, cities, num)
     return jsonify(job_id=job.id)
 
 
@@ -379,10 +400,7 @@ def api_scrape():
         concurrency=int(data.get("concurrency", 3)),
     )
 
-    thread = threading.Thread(
-        target=_run_url_job, args=(job, urls), daemon=True
-    )
-    thread.start()
+    _enqueue_job(_run_url_job, job, urls)
     return jsonify(job_id=job.id)
 
 
@@ -418,10 +436,7 @@ def api_import():
         concurrency=int(opts.get("concurrency", default_concurrency)),
     )
 
-    thread = threading.Thread(
-        target=_run_import_job, args=(job, records), daemon=True
-    )
-    thread.start()
+    _enqueue_job(_run_import_job, job, records)
     return jsonify(job_id=job.id)
 
 
