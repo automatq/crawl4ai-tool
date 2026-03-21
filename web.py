@@ -59,17 +59,19 @@ jobs: dict[str, Job] = {}
 import queue
 
 _work_queue: queue.Queue = queue.Queue()
-_NUM_WORKERS = 5  # 5 parallel browsers, safe for 8GB
+_NUM_WORKERS = 2  # Start conservative, scale up once stable
 
 
 def _worker():
     """Worker thread — pulls jobs from queue and runs them."""
+    import traceback
     while True:
         func, args = _work_queue.get()
         try:
             func(*args)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WORKER ERROR] {e}", flush=True)
+            traceback.print_exc()
         _work_queue.task_done()
 
 
@@ -345,6 +347,16 @@ def _run_url_job(job: Job, urls: list[str]):
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/health")
+def health():
+    return jsonify(
+        status="ok",
+        queue_size=_work_queue.qsize(),
+        active_jobs=sum(1 for j in jobs.values() if j.status in ("searching", "scraping")),
+        total_jobs=len(jobs),
+    )
 
 
 @app.post("/api/search")

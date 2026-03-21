@@ -34,4 +34,6 @@ COPY . .
 ENV PORT=5000
 EXPOSE 5000
 
-CMD ["python", "web.py"]
+# Use gunicorn for production stability
+# 1 worker, 8 threads, 600s timeout for long scrape jobs
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 600 web:app
