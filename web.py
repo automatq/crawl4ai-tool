@@ -8,9 +8,12 @@ Then open http://localhost:5000
 
 import asyncio
 import json
+import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -20,6 +23,41 @@ from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
+
+
+# ── Persistent backup to Railway volume ──────────────────────────────
+
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/data/backups"))
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_backup(job: "Job"):
+    """Save completed job results to the persistent volume."""
+    if not job.results:
+        return
+    try:
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime(job.created_at))
+        mode = job.input_config.get("mode", "unknown")
+        label = job.input_config.get("keyword", "") or job.input_config.get("url", "") or "import"
+        # Sanitize label for filesystem
+        label = re.sub(r'[^\w\-]', '_', label)[:40]
+        filename = f"{ts}_{job.id}_{mode}_{label}.json"
+
+        payload = {
+            "job_id": job.id,
+            "created_at": job.created_at,
+            "finished_at": job.finished_at,
+            "duration": round(job.duration, 1),
+            "status": job.status,
+            "input_config": job.input_config,
+            "lead_count": len(job.results),
+            "leads": job.results,
+        }
+        backup_path = BACKUP_DIR / filename
+        backup_path.write_text(json.dumps(payload, indent=2, default=str))
+        job.log(f"Backup saved: {filename}")
+    except Exception as e:
+        job.log(f"Backup failed: {e}", "error")
 
 
 # ── Job management ────────────────────────────────────────────────────
@@ -178,6 +216,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.progress_msg = f"Done — {len(leads)} leads scraped."
             job.finished_at = time.time()
         job.log(f"Completed: {len(leads)} leads scraped in {job.duration:.1f}s")
+        _save_backup(job)
 
     except InterruptedError:
         with job.lock:
@@ -280,6 +319,7 @@ def _run_import_job(job: Job, records: list[dict]):
             job.progress_msg = f"Done — {len(merged)} leads enriched."
             job.finished_at = time.time()
         job.log(f"Completed: {len(merged)} leads enriched in {job.duration:.1f}s")
+        _save_backup(job)
 
     except InterruptedError:
         with job.lock:
@@ -326,6 +366,7 @@ def _run_url_job(job: Job, urls: list[str]):
             job.progress_msg = f"Done — {len(leads)} leads found."
             job.finished_at = time.time()
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
+        _save_backup(job)
 
     except InterruptedError:
         with job.lock:
@@ -351,11 +392,13 @@ def index():
 
 @app.get("/health")
 def health():
+    backup_count = len(list(BACKUP_DIR.glob("*.json")))
     return jsonify(
         status="ok",
         queue_size=_work_queue.qsize(),
         active_jobs=sum(1 for j in jobs.values() if j.status in ("searching", "scraping")),
         total_jobs=len(jobs),
+        backups_on_disk=backup_count,
     )
 
 
@@ -530,6 +573,44 @@ def api_export(job_id):
         output.getvalue(),
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=leads.csv"},
+    )
+
+
+@app.get("/api/backups")
+def api_backups():
+    """List all backed-up scrape results from the persistent volume."""
+    backups = []
+    for f in sorted(BACKUP_DIR.glob("*.json"), reverse=True):
+        try:
+            meta = json.loads(f.read_text())
+            backups.append({
+                "filename": f.name,
+                "job_id": meta.get("job_id"),
+                "created_at": meta.get("created_at"),
+                "finished_at": meta.get("finished_at"),
+                "duration": meta.get("duration"),
+                "status": meta.get("status"),
+                "lead_count": meta.get("lead_count", 0),
+                "input_config": meta.get("input_config", {}),
+            })
+        except Exception:
+            continue
+    return jsonify(backups=backups)
+
+
+@app.get("/api/backups/<filename>")
+def api_backup_detail(filename):
+    """Retrieve a specific backup file's full data."""
+    # Prevent path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return jsonify(error="Invalid filename"), 400
+    path = BACKUP_DIR / filename
+    if not path.exists():
+        return jsonify(error="Backup not found"), 404
+    return Response(
+        path.read_text(),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
