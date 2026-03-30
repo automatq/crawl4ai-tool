@@ -309,6 +309,10 @@ def _run_import_job(job: Job, records: list[dict]):
                 result["rating"] = source["totalScore"]
             if source.get("neighborhood"):
                 result["neighborhood"] = source["neighborhood"]
+            if source.get("reviewsCount") and not result.get("google_reviews"):
+                result["google_reviews"] = source["reviewsCount"]
+            if source.get("totalScore") and not result.get("google_rating"):
+                result["google_rating"] = source["totalScore"]
 
             merged.append(result)
 
@@ -552,6 +556,7 @@ def api_export(job_id):
     w.writerow([
         "url", "company", "description", "emails", "phones",
         "address", "hours", "socials", "category", "rating", "neighborhood",
+        "google_reviews", "google_rating",
     ])
     for lead in job.results:
         if "error" in lead:
@@ -568,6 +573,8 @@ def api_export(job_id):
             lead.get("category", ""),
             lead.get("rating", ""),
             lead.get("neighborhood", ""),
+            lead.get("google_reviews", ""),
+            lead.get("google_rating", ""),
         ])
     return Response(
         output.getvalue(),

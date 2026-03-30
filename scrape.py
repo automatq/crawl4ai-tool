@@ -677,6 +677,99 @@ async def _search_google_maps(
     return found
 
 
+# ── Google review count lookup ────────────────────────────────────────
+
+# Patterns to extract review count and rating from Google search results
+_REVIEW_COUNT_RE = re.compile(r'(\d[\d,]*)\s*(?:Google\s+)?reviews?\b', re.I)
+_RATING_PARENS_RE = re.compile(r'([\d.]+)\s*(?:stars?)?\s*\((\d[\d,]*)\)', re.I)
+_RATING_PLAIN_RE = re.compile(r'([\d.]+)\s+out\s+of\s+5', re.I)
+
+
+async def _fetch_google_reviews(
+    company: str,
+    location_hint: str,
+    crawler: AsyncWebCrawler,
+    rate_limiter: DomainRateLimiter | None = None,
+) -> dict:
+    """Search Google for a business and extract review count + rating.
+
+    Returns {"google_reviews": int|None, "google_rating": float|None}.
+    Never raises — returns Nones on failure.
+    """
+    if not company:
+        return {"google_reviews": None, "google_rating": None}
+
+    # Build a short location hint from address (just city/state)
+    city = ""
+    if location_hint:
+        # Try to grab city from "123 Main St, Denver, CO 80202" style
+        parts = [p.strip() for p in location_hint.split(",")]
+        if len(parts) >= 2:
+            city = parts[-2]  # second-to-last is usually city
+        else:
+            city = parts[0]
+
+    query = f"{company} {city} reviews".strip()
+    search_url = f"https://www.google.com/search?q={quote_plus(query)}"
+
+    config = CrawlerRunConfig(
+        word_count_threshold=0,
+        remove_overlay_elements=True,
+    )
+
+    try:
+        result, err = await _crawl_with_retry(
+            crawler, search_url, config,
+            max_retries=1, timeout=15,
+            rate_limiter=rate_limiter,
+        )
+        if not result.success:
+            return {"google_reviews": None, "google_rating": None}
+
+        text = str(result.markdown) if result.markdown else ""
+
+        review_count = None
+        rating = None
+
+        # Try "4.5 (238)" pattern first — most reliable
+        m = _RATING_PARENS_RE.search(text)
+        if m:
+            try:
+                rating = float(m.group(1))
+                review_count = int(m.group(2).replace(",", ""))
+            except ValueError:
+                pass
+
+        # Fallback: "238 reviews" or "238 Google reviews"
+        if review_count is None:
+            m = _REVIEW_COUNT_RE.search(text)
+            if m:
+                try:
+                    review_count = int(m.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+
+        # Fallback for rating: "4.5 out of 5"
+        if rating is None:
+            m = _RATING_PLAIN_RE.search(text)
+            if m:
+                try:
+                    rating = float(m.group(1))
+                except ValueError:
+                    pass
+
+        # Sanity checks
+        if rating is not None and (rating < 0 or rating > 5):
+            rating = None
+        if review_count is not None and review_count > 1_000_000:
+            review_count = None  # Probably parsed a wrong number
+
+        return {"google_reviews": review_count, "google_rating": rating}
+
+    except Exception:
+        return {"google_reviews": None, "google_rating": None}
+
+
 # ── Unified multi-engine search ───────────────────────────────────────
 
 SEARCH_ENGINES = [
@@ -1252,15 +1345,25 @@ async def scrape_lead(
 
     structured = extract_structured_data(html)
 
+    company = guess_company_name(html, md, url, structured)
+    address = structured.get("address") or extract_address(combined_md)
+
+    # Look up Google review count for this business
+    google_data = await _fetch_google_reviews(
+        company, address or "", crawler, rate_limiter,
+    )
+
     return {
         "url": url,
-        "company": guess_company_name(html, md, url, structured),
+        "company": company,
         "description": extract_description(md),
         "emails": emails,
         "phones": extract_phones(combined_md),
-        "address": structured.get("address") or extract_address(combined_md),
+        "address": address,
         "socials": extract_social_links(combined_md),
         "hours": structured.get("hours") or extract_business_hours(html, combined_md),
+        "google_reviews": google_data.get("google_reviews"),
+        "google_rating": google_data.get("google_rating"),
     }
 
 
@@ -1286,6 +1389,9 @@ def format_table(leads: list[dict]) -> str:
             lines.append(f"  Address:     {lead['address']}")
         if lead.get("hours"):
             lines.append(f"  Hours:       {lead['hours']}")
+        if lead.get("google_reviews") is not None:
+            rating_str = f" ({lead['google_rating']}/5)" if lead.get("google_rating") else ""
+            lines.append(f"  Reviews:     {lead['google_reviews']}{rating_str}")
         if lead["socials"]:
             for platform, url in lead["socials"].items():
                 lines.append(f"  {platform:12s} {url}")
@@ -1295,7 +1401,7 @@ def format_table(leads: list[dict]) -> str:
 def write_csv(leads: list[dict], path: str):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["url", "company", "description", "emails", "phones", "address", "hours", "socials"])
+        w.writerow(["url", "company", "description", "emails", "phones", "address", "hours", "socials", "google_reviews", "google_rating"])
         for lead in leads:
             w.writerow([
                 lead.get("url", ""),
@@ -1306,6 +1412,8 @@ def write_csv(leads: list[dict], path: str):
                 lead.get("address", ""),
                 lead.get("hours", ""),
                 json.dumps(lead.get("socials", {})),
+                lead.get("google_reviews", ""),
+                lead.get("google_rating", ""),
             ])
     print(f"\nSaved {len(leads)} leads to {path}")
 

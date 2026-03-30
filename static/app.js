@@ -259,7 +259,7 @@ function renderResults(data) {
     const tr = document.createElement("tr");
     if (lead.error) {
       tr.className = "error-row";
-      tr.innerHTML = `<td colspan="7">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
+      tr.innerHTML = `<td colspan="9">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
     } else {
       const emails = (lead.emails || []).join("; ");
       const phones = (lead.phones || []).join("; ");
@@ -274,6 +274,8 @@ function renderResults(data) {
         <td class="cell-copy" title="Click to copy">${esc(phones)}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.address || "")}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.hours || "")}</td>
+        <td class="cell-copy" title="Click to copy">${lead.google_reviews != null ? esc(String(lead.google_reviews)) : ""}</td>
+        <td class="cell-copy" title="Click to copy">${lead.google_rating != null ? esc(String(lead.google_rating)) : ""}</td>
         <td class="cell-socials">${socials}</td>
       `;
       tr.querySelectorAll(".cell-copy").forEach((td) => {
