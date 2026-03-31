@@ -11,6 +11,7 @@ Optionally enriches results by visiting business websites for emails/socials.
 
 import asyncio
 import json
+import logging
 import random
 import re
 import time
@@ -27,10 +28,11 @@ from scrape import (
     extract_emails,
     extract_phones,
     extract_social_links,
-    extract_structured_data,
     extract_description,
-    guess_company_name,
 )
+
+log = logging.getLogger("gmaps")
+logging.basicConfig(level=logging.INFO)
 
 
 # ── Browser config for Maps (needs full DOM, not text-only) ──────────
@@ -46,6 +48,7 @@ def _make_maps_browser_config(config: ScrapeConfig) -> BrowserConfig:
         extra_args=[
             "--disable-gpu",
             "--disable-dev-shm-usage",
+            "--lang=en-US",
         ],
     )
     if config.proxies:
@@ -53,48 +56,44 @@ def _make_maps_browser_config(config: ScrapeConfig) -> BrowserConfig:
     return BrowserConfig(**kwargs)
 
 
-# ── JavaScript for scrolling the results panel ───────────────────────
+# ── JavaScript snippets ──────────────────────────────────────────────
 
-SCROLL_JS = """
-(async () => {
-    // Find the scrollable results container
-    const feed = document.querySelector('div[role="feed"]');
-    if (!feed) return 0;
-
-    let prevCount = 0;
-    let sameCountRounds = 0;
-    const maxScrolls = %d;
-
-    for (let i = 0; i < maxScrolls; i++) {
-        feed.scrollTop = feed.scrollHeight;
-        await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
-
-        const items = feed.querySelectorAll('div[jsaction*="mouseover"]');
-        const count = items.length;
-
-        // Check if we've reached the end marker
-        const endMarker = feed.querySelector('span.HlvSq');
-        if (endMarker) break;
-
-        if (count === prevCount) {
-            sameCountRounds++;
-            if (sameCountRounds >= 3) break;
-        } else {
-            sameCountRounds = 0;
-        }
-        prevCount = count;
+# Dismiss Google consent dialog if present
+CONSENT_JS = """
+// Click "Accept all" on consent dialog
+const btns = document.querySelectorAll('button');
+for (const btn of btns) {
+    const text = btn.textContent.trim().toLowerCase();
+    if (text === 'accept all' || text === 'i agree' || text === 'consent') {
+        btn.click();
+        break;
     }
-    return prevCount;
-})()
+}
+// Also try the form-based consent
+const form = document.querySelector('form[action*="consent"]');
+if (form) {
+    const submit = form.querySelector('button, input[type="submit"]');
+    if (submit) submit.click();
+}
 """
+
+# Scroll the results panel to load more listings
+SCROLL_JS = """
+// Scroll the results feed to load more items
+const feed = document.querySelector('div[role="feed"]');
+if (feed) {
+    feed.scrollTop = feed.scrollHeight;
+}
+// Count current items
+const links = document.querySelectorAll('a[href*="/maps/place/"]');
+links.length;
+"""
+
 
 # ── Parsing helpers ──────────────────────────────────────────────────
 
 _COORD_RE = re.compile(r'@(-?\d+\.\d+),(-?\d+\.\d+)')
 _PLACE_ID_RE = re.compile(r'ChIJ[\w-]+')
-_RATING_RE = re.compile(r'(\d\.?\d?)\s*stars?', re.I)
-_REVIEW_COUNT_RE = re.compile(r'\((\d[\d,]*)\)', re.I)
-_PRICE_RE = re.compile(r'(\${1,4})\s*·')
 _PHONE_RE = re.compile(
     r'(?<!\d)(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?[2-9]\d{2}[-.\s]?\d{4}(?!\d)'
 )
@@ -105,24 +104,21 @@ _HOURS_ARIA_RE = re.compile(
 _REVIEW_DIST_RE = re.compile(
     r'(\d)\s*stars?,\s*(\d[\d,]*)\s*reviews?', re.I
 )
-_PLUS_CODE_RE = re.compile(r'[23456789CFGHJMPQRVWX]{4}\+[23456789CFGHJMPQRVWX]{2,3}\s+\w+', re.I)
+_PLUS_CODE_RE = re.compile(
+    r'[23456789CFGHJMPQRVWX]{4}\+[23456789CFGHJMPQRVWX]{2,3}\s+\w+', re.I
+)
 
 
 def _parse_listings_from_html(html: str) -> list[dict]:
-    """Extract listing cards from the Maps search results page HTML.
-
-    Uses aria-labels and href patterns for stability across Google's
-    frequent class name changes.
-    """
+    """Extract listing cards from the Maps search results page HTML."""
     listings = []
     seen_urls = set()
 
-    # Find all place links: <a href="/maps/place/..." aria-label="Business Name">
+    # Find place links with aria-labels
     link_re = re.compile(
-        r'<a[^>]+href="(/maps/place/[^"]+)"[^>]*aria-label="([^"]*)"',
-        re.I,
+        r'<a[^>]+href="(/maps/place/[^"]+)"[^>]*?aria-label="([^"]*)"',
+        re.I | re.S,
     )
-
     for match in link_re.finditer(html):
         path, name = match.group(1), match.group(2)
         maps_url = "https://www.google.com" + path
@@ -131,37 +127,66 @@ def _parse_listings_from_html(html: str) -> list[dict]:
             continue
         seen_urls.add(maps_url)
 
-        # Extract coordinates from URL
         lat, lng = None, None
         coord_match = _COORD_RE.search(path)
         if coord_match:
             lat = float(coord_match.group(1))
             lng = float(coord_match.group(2))
 
-        # Extract place ID from URL
         place_id = ""
         pid_match = _PLACE_ID_RE.search(path)
         if pid_match:
             place_id = pid_match.group(0)
 
-        listing = {
+        listings.append({
             "name": name.strip(),
             "maps_url": maps_url,
             "latitude": lat,
             "longitude": lng,
             "place_id": place_id,
-        }
-        listings.append(listing)
+        })
+
+    # Fallback: if no aria-label links, try href-only approach
+    if not listings:
+        href_re = re.compile(r'href="(/maps/place/([^/]+)/[^"]*)"', re.I)
+        for match in href_re.finditer(html):
+            path = match.group(1)
+            name = match.group(2).replace("+", " ")
+            maps_url = "https://www.google.com" + path
+
+            if maps_url in seen_urls:
+                continue
+            seen_urls.add(maps_url)
+
+            lat, lng = None, None
+            coord_match = _COORD_RE.search(path)
+            if coord_match:
+                lat = float(coord_match.group(1))
+                lng = float(coord_match.group(2))
+
+            place_id = ""
+            pid_match = _PLACE_ID_RE.search(path)
+            if pid_match:
+                place_id = pid_match.group(0)
+
+            listings.append({
+                "name": name.strip(),
+                "maps_url": maps_url,
+                "latitude": lat,
+                "longitude": lng,
+                "place_id": place_id,
+            })
 
     return listings
 
 
-def _parse_listing_detail(html: str, maps_url: str) -> dict:
+def _parse_listing_detail(html: str, md: str, maps_url: str) -> dict:
     """Parse full details from an individual listing's Maps page."""
     detail = {}
+    # Combine HTML and markdown for searching
+    text = html + "\n" + md
 
     # ── Rating & review count ──
-    # aria-label="4.5 stars 238 Reviews"
     stars_label = re.search(
         r'aria-label="(\d\.?\d?)\s*stars?\s*(\d[\d,]*)\s*[Rr]eviews?"', html
     )
@@ -169,35 +194,46 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
         detail["rating"] = float(stars_label.group(1))
         detail["review_count"] = int(stars_label.group(2).replace(",", ""))
     else:
-        # Fallback: separate patterns
-        r = _RATING_RE.search(html)
-        if r:
-            detail["rating"] = float(r.group(1))
-        rc = _REVIEW_COUNT_RE.search(html)
-        if rc:
-            detail["review_count"] = int(rc.group(1).replace(",", ""))
+        # Try markdown patterns like "4.5(238)"
+        md_rating = re.search(r'(\d\.\d)\s*\((\d[\d,]*)\)', md)
+        if md_rating:
+            detail["rating"] = float(md_rating.group(1))
+            detail["review_count"] = int(md_rating.group(2).replace(",", ""))
+        else:
+            r = re.search(r'(\d\.?\d?)\s*stars?', html, re.I)
+            if r:
+                detail["rating"] = float(r.group(1))
+            rc = re.search(r'\((\d[\d,]*)\s*(?:reviews?)?\)', html)
+            if rc:
+                detail["review_count"] = int(rc.group(1).replace(",", ""))
 
     # ── Category ──
-    # Category appears in a button with jsaction containing "category"
-    cat_re = re.compile(r'<button[^>]*jsaction="[^"]*category[^"]*"[^>]*>([^<]+)</button>', re.I)
-    cat_match = cat_re.search(html)
+    # In markdown, category often appears near the top
+    cat_match = re.search(r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[a-z]+)*)\s*\n.*?(?:stars?|\d\.\d)', md)
+    if not cat_match:
+        cat_match = re.search(
+            r'<button[^>]*jsaction="[^"]*category[^"]*"[^>]*>([^<]+)</button>', html, re.I
+        )
     if cat_match:
         detail["category"] = cat_match.group(1).strip()
-    else:
-        # Fallback: look for category-like span near the rating
-        cat_re2 = re.compile(r'<span[^>]*>([^<]+)</span>\s*·\s*(?:\$|€|£)', re.I)
-        cat_match2 = cat_re2.search(html)
-        if cat_match2:
-            detail["category"] = cat_match2.group(1).strip()
 
     # ── Address ──
-    # aria-label="Address: 123 Main St, Denver, CO 80202"
     addr_re = re.compile(r'aria-label="Address[:\s]*([^"]+)"', re.I)
     addr_match = addr_re.search(html)
     if addr_match:
         full_addr = addr_match.group(1).strip()
         detail["address"] = full_addr
         _parse_address_components(full_addr, detail)
+    else:
+        # Try markdown — address often has a street number
+        addr_md = re.search(
+            r'(\d{1,5}\s+[\w\s.]+(?:St|Street|Ave|Avenue|Blvd|Dr|Drive|Rd|Road|Ln|Way|Ct|Pl)'
+            r'[.,]?\s*[\w\s]*,?\s*[A-Z]{2}\s*\d{5})',
+            md, re.I
+        )
+        if addr_md:
+            detail["address"] = addr_md.group(1).strip()
+            _parse_address_components(detail["address"], detail)
 
     # ── Phone ──
     phone_re = re.compile(r'aria-label="Phone[:\s]*([^"]+)"', re.I)
@@ -205,13 +241,10 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
     if phone_match:
         detail["phone"] = phone_match.group(1).strip()
     else:
-        # Fallback: data-tooltip="Copy phone number" nearby
-        phone_tooltip = re.search(
-            r'data-tooltip="Copy phone number"[^>]*>.*?<span[^>]*>([^<]+)</span>',
-            html, re.S
-        )
-        if phone_tooltip:
-            detail["phone"] = phone_tooltip.group(1).strip()
+        # Try markdown for phone patterns
+        phones = _PHONE_RE.findall(md)
+        if phones:
+            detail["phone"] = phones[0].strip()
 
     # ── Website ──
     web_re = re.compile(r'aria-label="Website[:\s]*([^"]+)"', re.I)
@@ -219,19 +252,30 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
     if web_match:
         detail["website"] = web_match.group(1).strip()
     else:
-        # Look for the website link directly
         web_link = re.search(
             r'<a[^>]+data-item-id="authority"[^>]+href="([^"]+)"', html
         )
         if web_link:
             detail["website"] = web_link.group(1).strip()
+        else:
+            # Look in markdown for website-like URLs
+            web_md = re.search(
+                r'\]\((https?://(?!www\.google|maps\.google|play\.google)[^\s)]+)\)',
+                md
+            )
+            if web_md:
+                url = web_md.group(1)
+                parsed = urlparse(url)
+                if parsed.netloc and '.' in parsed.netloc:
+                    skip = {'google.com', 'gstatic.com', 'googleapis.com', 'ggpht.com'}
+                    if not any(parsed.netloc.endswith(s) for s in skip):
+                        detail["website"] = url
 
     # ── Price level ──
-    price_match = _PRICE_RE.search(html)
+    price_match = re.search(r'(\${1,4})\s*·', text)
     if price_match:
         detail["price_level"] = price_match.group(1)
     else:
-        # Check aria-label
         price_aria = re.search(r'aria-label="[^"]*(\${1,4})\s*·', html)
         if price_aria:
             detail["price_level"] = price_aria.group(1)
@@ -241,7 +285,6 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
     if hours_match:
         detail["hours"] = hours_match.group(1).strip()
     else:
-        # Try table-based hours
         hours_rows = re.findall(
             r'<tr[^>]*>.*?<td[^>]*>(\w+day)</td>.*?<td[^>]*>([^<]+)</td>.*?</tr>',
             html, re.S | re.I
@@ -254,7 +297,6 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
     for star, count in _REVIEW_DIST_RE.findall(html):
         dist[star] = int(count.replace(",", ""))
     if not dist:
-        # Fallback: percentage-based distribution
         pct_re = re.compile(r'(\d)\s*stars?\s*(\d+)%', re.I)
         total = detail.get("review_count", 0)
         for star, pct in pct_re.findall(html):
@@ -281,10 +323,10 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
 
     # ── Closed status ──
     detail["is_temporarily_closed"] = bool(
-        re.search(r'temporarily closed', html, re.I)
+        re.search(r'temporarily closed', text, re.I)
     )
     detail["is_permanently_closed"] = bool(
-        re.search(r'permanently closed', html, re.I)
+        re.search(r'permanently closed', text, re.I)
     )
 
     # ── Description ──
@@ -296,7 +338,10 @@ def _parse_listing_detail(html: str, maps_url: str) -> dict:
         detail["description"] = desc_match.group(1).strip()
 
     # ── Thumbnail ──
-    thumb_re = re.compile(r'<img[^>]+class="[^"]*(?:p6VGsd|tactile-hero-image)[^"]*"[^>]+src="([^"]+)"', re.I)
+    thumb_re = re.compile(
+        r'<img[^>]+class="[^"]*(?:p6VGsd|tactile-hero-image)[^"]*"[^>]+src="([^"]+)"',
+        re.I,
+    )
     thumb_match = thumb_re.search(html)
     if thumb_match:
         detail["thumbnail_url"] = thumb_match.group(1)
@@ -309,8 +354,7 @@ def _parse_address_components(address: str, detail: dict):
     parts = [p.strip() for p in address.split(",")]
     if len(parts) >= 3:
         detail["street"] = parts[0]
-        detail["city"] = parts[-2].strip() if len(parts) >= 3 else ""
-        # Last part often has "STATE ZIP"
+        detail["city"] = parts[-2].strip()
         last = parts[-1].strip()
         state_zip = re.match(r'([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?', last)
         if state_zip:
@@ -330,31 +374,89 @@ async def _scroll_and_collect(
     search_url: str,
     max_results: int,
     rate_limiter: DomainRateLimiter,
+    on_log: Callable | None = None,
 ) -> str:
-    """Navigate to Maps search URL and scroll to load all results.
+    """Navigate to Maps search URL and scroll to load all results."""
 
-    Returns the full HTML of the page after scrolling.
-    """
-    max_scrolls = (max_results // 10) + 5
+    def _log(msg):
+        log.info(msg)
+        if on_log:
+            on_log(msg)
 
-    config = CrawlerRunConfig(
+    # Step 1: Initial page load with consent dismissal
+    initial_config = CrawlerRunConfig(
         word_count_threshold=0,
         remove_overlay_elements=True,
-        wait_until="networkidle",
-        js_code=SCROLL_JS % max_scrolls,
-        delay_before_return_html=2.0,
+        wait_until="domcontentloaded",
+        js_code=CONSENT_JS,
+        delay_before_return_html=3.0,
     )
 
+    _log("Loading Google Maps search page...")
     result, err = await _crawl_with_retry(
-        crawler, search_url, config,
-        max_retries=2, timeout=60,
+        crawler, search_url, initial_config,
+        max_retries=3, timeout=45,
         rate_limiter=rate_limiter,
     )
 
     if not result.success:
+        _log(f"Failed to load Maps: {getattr(result, 'error_message', err)}")
         return ""
 
-    return str(result.html) if result.html else ""
+    html = str(result.html) if result.html else ""
+    _log(f"Page loaded ({len(html)} chars HTML)")
+
+    # Check if we got results already
+    listings = _parse_listings_from_html(html)
+    _log(f"Initial parse: {len(listings)} listings found")
+
+    if len(listings) >= max_results:
+        return html
+
+    # Step 2: Scroll to load more results
+    prev_count = len(listings)
+    stale_rounds = 0
+    max_scroll_attempts = (max_results // 5) + 5
+
+    for scroll_i in range(max_scroll_attempts):
+        if len(listings) >= max_results:
+            break
+
+        scroll_config = CrawlerRunConfig(
+            word_count_threshold=0,
+            remove_overlay_elements=True,
+            wait_until="domcontentloaded",
+            js_code=SCROLL_JS,
+            delay_before_return_html=2.0,
+        )
+
+        result, err = await _crawl_with_retry(
+            crawler, search_url, scroll_config,
+            max_retries=1, timeout=20,
+            rate_limiter=rate_limiter,
+        )
+
+        if not result.success:
+            _log(f"Scroll attempt {scroll_i + 1} failed, stopping")
+            break
+
+        html = str(result.html) if result.html else html
+        listings = _parse_listings_from_html(html)
+
+        if len(listings) == prev_count:
+            stale_rounds += 1
+            if stale_rounds >= 3:
+                _log(f"No new listings after 3 scrolls, stopping at {len(listings)}")
+                break
+        else:
+            stale_rounds = 0
+            _log(f"Scroll {scroll_i + 1}: {len(listings)} listings loaded")
+
+        prev_count = len(listings)
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+
+    _log(f"Finished scrolling: {len(listings)} total listings")
+    return html
 
 
 async def _scrape_detail_page(
@@ -366,12 +468,12 @@ async def _scrape_detail_page(
     config = CrawlerRunConfig(
         word_count_threshold=0,
         remove_overlay_elements=True,
-        wait_until="networkidle",
-        delay_before_return_html=1.5,
+        wait_until="domcontentloaded",
+        js_code=CONSENT_JS,
+        delay_before_return_html=2.0,
     )
 
-    # Random delay to avoid detection
-    await asyncio.sleep(random.uniform(2.0, 5.0))
+    await asyncio.sleep(random.uniform(2.0, 4.0))
 
     result, err = await _crawl_with_retry(
         crawler, maps_url, config,
@@ -383,7 +485,8 @@ async def _scrape_detail_page(
         return {}
 
     html = str(result.html) if result.html else ""
-    return _parse_listing_detail(html, maps_url)
+    md = str(result.markdown) if result.markdown else ""
+    return _parse_listing_detail(html, md, maps_url)
 
 
 async def _enrich_with_website(
@@ -457,7 +560,7 @@ async def scrape_google_maps(
     browser_config = _make_maps_browser_config(config)
     rate_limiter = DomainRateLimiter(min_delay=3.0)
 
-    max_results = min(max_results, 120)  # Google Maps hard limit
+    max_results = min(max_results, 120)
 
     def progress(current, total, msg):
         if on_progress:
@@ -469,7 +572,10 @@ async def scrape_google_maps(
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
         # Phase 1: Scroll search results to load listings
-        html = await _scroll_and_collect(crawler, search_url, max_results, rate_limiter)
+        html = await _scroll_and_collect(
+            crawler, search_url, max_results, rate_limiter,
+            on_log=lambda msg: progress(0, max_results, msg),
+        )
 
         if not html:
             progress(0, max_results, "No results found on Google Maps")
@@ -486,21 +592,18 @@ async def scrape_google_maps(
         progress(0, len(listings), f"Found {len(listings)} listings, scraping details...")
 
         # Phase 3: Visit each listing's detail page
-        leads = []
         sem = asyncio.Semaphore(config.concurrency)
 
         async def scrape_one(i: int, listing: dict) -> dict:
             async with sem:
-                progress(i, len(listings), f"Scraping {listing['name']}...")
+                progress(i, len(listings), f"[{i+1}/{len(listings)}] {listing['name']}")
 
                 detail = await _scrape_detail_page(
                     crawler, listing["maps_url"], rate_limiter
                 )
 
-                # Merge listing data with detail data
                 lead = {**listing, **detail}
 
-                # Normalize the lead structure
                 lead.setdefault("category", "")
                 lead.setdefault("address", "")
                 lead.setdefault("phone", "")
@@ -524,13 +627,12 @@ async def scrape_google_maps(
                 return lead
 
         tasks = [scrape_one(i, l) for i, l in enumerate(listings)]
-        leads = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Filter out exceptions
         good_leads = []
-        for i, lead in enumerate(leads):
+        for i, lead in enumerate(results):
             if isinstance(lead, Exception):
-                progress(i + 1, len(listings), f"Error scraping listing: {lead}")
+                progress(i + 1, len(listings), f"Error: {lead}")
                 continue
             good_leads.append(lead)
 
@@ -546,7 +648,7 @@ async def scrape_google_maps(
                 async def enrich_one(i: int, lead: dict) -> dict:
                     async with sem:
                         progress(i, len(with_websites),
-                                 f"Enriching {lead['name']} from website...")
+                                 f"[{i+1}/{len(with_websites)}] Enriching {lead['name']}...")
                         return await _enrich_with_website(
                             lead, crawler, rate_limiter, config
                         )
@@ -556,7 +658,6 @@ async def scrape_google_maps(
                 ]
                 enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
 
-                # Update leads with enriched data
                 enriched_map = {}
                 for i, result in enumerate(enriched):
                     if not isinstance(result, Exception):
