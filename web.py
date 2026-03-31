@@ -20,6 +20,7 @@ from uuid import uuid4
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
+from gmaps import scrape_google_maps
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
@@ -340,6 +341,66 @@ def _run_import_job(job: Job, records: list[dict]):
         job.log(f"Error: {e}", "error")
 
 
+def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
+    """Run a Google Maps scraping job."""
+    try:
+        cfg = _make_config(job.input_config)
+
+        with job.lock:
+            job.status = "searching"
+            job.progress_msg = f"Searching Google Maps for '{query}'..."
+        job.log(f"Starting Google Maps scrape: '{query}' (max {max_results})")
+        if cfg.stealth:
+            job.log("Stealth mode: enabled")
+        if cfg.proxies:
+            job.log(f"Proxy rotation: {len(cfg.proxies)} proxies")
+        if enrich:
+            job.log("Website enrichment: enabled (emails/socials)")
+
+        def maps_progress(current, total, msg):
+            if job.cancel_flag:
+                raise InterruptedError("Cancelled")
+            with job.lock:
+                if enrich:
+                    # 0-70% for Maps, 70-100% for enrichment
+                    job.progress_pct = min(70, int((current / max(total, 1)) * 70))
+                else:
+                    job.progress_pct = int((current / max(total, 1)) * 100)
+                job.progress_msg = msg
+            job.log(msg)
+
+        leads = asyncio.run(scrape_google_maps(
+            query=query,
+            max_results=max_results,
+            enrich_websites=enrich,
+            config=cfg,
+            on_progress=maps_progress,
+        ))
+
+        with job.lock:
+            job.status = "done"
+            job.progress_pct = 100
+            job.results = leads
+            job.progress_msg = f"Done — {len(leads)} leads from Google Maps."
+            job.finished_at = time.time()
+        job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
+        _save_backup(job)
+
+    except InterruptedError:
+        with job.lock:
+            job.status = "cancelled"
+            job.progress_msg = "Cancelled by user."
+            job.finished_at = time.time()
+        job.log("Cancelled by user", "warn")
+    except Exception as e:
+        with job.lock:
+            job.status = "error"
+            job.error = str(e)
+            job.progress_msg = f"Error: {e}"
+            job.finished_at = time.time()
+        job.log(f"Error: {e}", "error")
+
+
 def _run_url_job(job: Job, urls: list[str]):
     try:
         cfg = _make_config(job.input_config)
@@ -429,6 +490,35 @@ def api_search():
     )
 
     _work_queue.put((_run_keyword_job, (job, keyword, cities, num)))
+    return jsonify(job_id=job.id)
+
+
+@app.post("/api/maps")
+def api_maps():
+    data = request.get_json(force=True)
+    keyword = data.get("keyword", "").strip()
+    city = data.get("city", "").strip()
+    query = data.get("query", "").strip()
+    max_results = min(int(data.get("max_results", 100)), 120)
+    enrich = data.get("enrich_websites", False)
+
+    if not query:
+        if keyword and city:
+            query = f"{keyword} in {city}"
+        elif keyword:
+            query = keyword
+        else:
+            return jsonify(error="Keyword or query is required"), 400
+
+    job = _create_job(
+        mode="maps", query=query, max_results=max_results,
+        enrich_websites=enrich,
+        stealth=data.get("stealth", True),
+        proxies=data.get("proxies", ""),
+        concurrency=int(data.get("concurrency", 2)),
+    )
+
+    _work_queue.put((_run_maps_job, (job, query, max_results, enrich)))
     return jsonify(job_id=job.id)
 
 
@@ -555,12 +645,16 @@ def api_export(job_id):
     w = csv.writer(output)
     w.writerow([
         "url", "company", "description", "emails", "phones",
-        "address", "hours", "socials", "category", "rating", "neighborhood",
-        "google_reviews", "google_rating",
+        "address", "city", "state", "zip_code", "hours", "socials",
+        "category", "rating", "neighborhood",
+        "google_reviews", "google_rating", "review_distribution",
+        "price_level", "maps_url", "latitude", "longitude",
+        "place_id", "plus_code", "is_closed",
     ])
     for lead in job.results:
         if "error" in lead:
             continue
+        is_closed = lead.get("is_temporarily_closed") or lead.get("is_permanently_closed")
         w.writerow([
             lead.get("url", ""),
             lead.get("company", ""),
@@ -568,6 +662,9 @@ def api_export(job_id):
             "; ".join(lead.get("emails", [])),
             "; ".join(lead.get("phones", [])),
             lead.get("address", "") or "",
+            lead.get("city", "") or "",
+            lead.get("state", "") or "",
+            lead.get("zip_code", "") or "",
             lead.get("hours", "") or "",
             json.dumps(lead.get("socials", {})),
             lead.get("category", ""),
@@ -575,6 +672,14 @@ def api_export(job_id):
             lead.get("neighborhood", ""),
             lead.get("google_reviews", ""),
             lead.get("google_rating", ""),
+            json.dumps(lead.get("review_distribution", {})) if lead.get("review_distribution") else "",
+            lead.get("price_level", ""),
+            lead.get("maps_url", ""),
+            lead.get("latitude", ""),
+            lead.get("longitude", ""),
+            lead.get("place_id", ""),
+            lead.get("plus_code", ""),
+            "Yes" if is_closed else "",
         ])
     return Response(
         output.getvalue(),

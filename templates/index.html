@@ -37,6 +37,7 @@
 
       <div class="input-mode-toggle">
         <button class="mode-btn active" data-mode="keyword">Keyword Search</button>
+        <button class="mode-btn" data-mode="maps">Google Maps</button>
         <button class="mode-btn" data-mode="url">Direct URL</button>
         <button class="mode-btn" data-mode="import">Import File</button>
       </div>
@@ -57,6 +58,32 @@
           <label for="num-results">Max leads</label>
           <input type="number" id="num-results" value="50" min="1" max="500">
           <small>Maximum number of leads to collect</small>
+        </div>
+      </div>
+
+      <!-- Google Maps form -->
+      <div id="maps-fields" class="form-section" hidden>
+        <div class="field">
+          <label for="maps-keyword">Business type</label>
+          <input type="text" id="maps-keyword" placeholder='e.g. "plumber", "dentist", "restaurant"'>
+          <small>The type of business to search for on Google Maps</small>
+        </div>
+        <div class="field">
+          <label for="maps-city">Location</label>
+          <input type="text" id="maps-city" placeholder='e.g. "Denver, CO" or "New York"'>
+          <small>City or area to search in</small>
+        </div>
+        <div class="field field-sm">
+          <label for="maps-max">Max results</label>
+          <input type="number" id="maps-max" value="100" min="1" max="120">
+          <small>Google Maps shows up to ~120 results per search</small>
+        </div>
+        <div class="option-row">
+          <label class="toggle-label">
+            <input type="checkbox" id="maps-enrich" checked>
+            <span>Enrich with website data</span>
+          </label>
+          <small>Visit each business website to extract emails and social links (slower but more data)</small>
         </div>
       </div>
 
@@ -190,6 +217,7 @@
           <thead>
             <tr>
               <th data-col="company" class="sortable">Company</th>
+              <th data-col="category" class="sortable">Category</th>
               <th data-col="url" class="sortable">URL</th>
               <th data-col="emails" class="sortable">Emails</th>
               <th data-col="phones" class="sortable">Phones</th>
@@ -197,7 +225,9 @@
               <th data-col="hours" class="sortable">Hours</th>
               <th data-col="google_reviews" class="sortable">Reviews</th>
               <th data-col="google_rating" class="sortable">Rating</th>
+              <th data-col="price_level" class="sortable">Price</th>
               <th data-col="socials">Socials</th>
+              <th data-col="maps_url">Maps</th>
             </tr>
           </thead>
           <tbody id="results-body"></tbody>
