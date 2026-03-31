@@ -41,6 +41,7 @@ $$(".mode-btn").forEach((btn) => {
     btn.classList.add("active");
     currentMode = btn.dataset.mode;
     $("#keyword-fields").hidden = currentMode !== "keyword";
+    $("#maps-fields").hidden = currentMode !== "maps";
     $("#url-fields").hidden = currentMode !== "url";
     $("#import-fields").hidden = currentMode !== "import";
   });
@@ -110,6 +111,17 @@ $("#start-btn").addEventListener("click", async () => {
     }
     endpoint = "/api/search";
     payload = { keyword, cities, num, ...advancedOpts };
+  } else if (currentMode === "maps") {
+    const keyword = $("#maps-keyword").value.trim();
+    const city = $("#maps-city").value.trim();
+    const maxResults = parseInt($("#maps-max").value) || 100;
+    const enrich = $("#maps-enrich").checked;
+    if (!keyword) {
+      showToast("Enter a business type to search for", "warn");
+      return;
+    }
+    endpoint = "/api/maps";
+    payload = { keyword, city, max_results: maxResults, enrich_websites: enrich, ...advancedOpts };
   } else if (currentMode === "import") {
     if (!importedData || !importedData.length) {
       showToast("Upload a JSON file first", "warn");
@@ -259,24 +271,29 @@ function renderResults(data) {
     const tr = document.createElement("tr");
     if (lead.error) {
       tr.className = "error-row";
-      tr.innerHTML = `<td colspan="9">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
+      tr.innerHTML = `<td colspan="12">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
     } else {
       const emails = (lead.emails || []).join("; ");
       const phones = (lead.phones || []).join("; ");
       const socials = Object.entries(lead.socials || {})
         .map(([p, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(p)}</a>`)
         .join(" ");
+      const urlDisplay = lead.url ? `<a href="${esc(lead.url)}" target="_blank" rel="noopener">${esc(truncUrl(lead.url))}</a>` : "";
+      const mapsDisplay = lead.maps_url ? `<a href="${esc(lead.maps_url)}" target="_blank" rel="noopener">View</a>` : "";
 
       tr.innerHTML = `
         <td class="cell-copy" title="Click to copy">${esc(lead.company || "")}</td>
-        <td><a href="${esc(lead.url)}" target="_blank" rel="noopener">${esc(truncUrl(lead.url))}</a></td>
+        <td class="cell-copy" title="Click to copy">${esc(lead.category || "")}</td>
+        <td>${urlDisplay}</td>
         <td class="cell-copy" title="Click to copy">${esc(emails)}</td>
         <td class="cell-copy" title="Click to copy">${esc(phones)}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.address || "")}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.hours || "")}</td>
         <td class="cell-copy" title="Click to copy">${lead.google_reviews != null ? esc(String(lead.google_reviews)) : ""}</td>
         <td class="cell-copy" title="Click to copy">${lead.google_rating != null ? esc(String(lead.google_rating)) : ""}</td>
+        <td class="cell-copy" title="Click to copy">${esc(lead.price_level || "")}</td>
         <td class="cell-socials">${socials}</td>
+        <td>${mapsDisplay}</td>
       `;
       tr.querySelectorAll(".cell-copy").forEach((td) => {
         td.addEventListener("click", () => {
@@ -332,10 +349,11 @@ $("#filter-input").addEventListener("input", () => {
   }
   const filtered = leads.filter((lead) => {
     const text = [
-      lead.company, lead.url,
+      lead.company, lead.url, lead.category || "",
       (lead.emails || []).join(" "),
       (lead.phones || []).join(" "),
       lead.address || "", lead.hours || "",
+      lead.price_level || "",
       Object.keys(lead.socials || {}).join(" "),
     ].join(" ").toLowerCase();
     return text.includes(q);
