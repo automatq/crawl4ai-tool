@@ -114,70 +114,91 @@ def _parse_listings_from_html(html: str) -> list[dict]:
     listings = []
     seen_urls = set()
 
-    # Find place links with aria-labels
+    # Save debug HTML on first call for diagnostics
+    try:
+        from pathlib import Path
+        debug_dir = Path("/data/debug") if Path("/data").exists() else Path("/tmp")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_file = debug_dir / "maps_debug.html"
+        debug_file.write_text(html[:500000])
+        log.info(f"Debug HTML saved to {debug_file}")
+    except Exception as e:
+        log.warning(f"Could not save debug HTML: {e}")
+
+    # Strategy 1: aria-label on anchor tags
     link_re = re.compile(
-        r'<a[^>]+href="(/maps/place/[^"]+)"[^>]*?aria-label="([^"]*)"',
+        r'<a\s[^>]*?href="(/maps/place/[^"]+)"[^>]*?aria-label="([^"]*)"',
         re.I | re.S,
     )
     for match in link_re.finditer(html):
         path, name = match.group(1), match.group(2)
-        maps_url = "https://www.google.com" + path
+        _add_listing(listings, seen_urls, path, name)
 
-        if maps_url in seen_urls:
-            continue
-        seen_urls.add(maps_url)
+    # Strategy 1b: aria-label before href (attribute order varies)
+    if not listings:
+        link_re2 = re.compile(
+            r'<a\s[^>]*?aria-label="([^"]*)"[^>]*?href="(/maps/place/[^"]+)"',
+            re.I | re.S,
+        )
+        for match in link_re2.finditer(html):
+            name, path = match.group(1), match.group(2)
+            _add_listing(listings, seen_urls, path, name)
 
-        lat, lng = None, None
-        coord_match = _COORD_RE.search(path)
-        if coord_match:
-            lat = float(coord_match.group(1))
-            lng = float(coord_match.group(2))
-
-        place_id = ""
-        pid_match = _PLACE_ID_RE.search(path)
-        if pid_match:
-            place_id = pid_match.group(0)
-
-        listings.append({
-            "name": name.strip(),
-            "maps_url": maps_url,
-            "latitude": lat,
-            "longitude": lng,
-            "place_id": place_id,
-        })
-
-    # Fallback: if no aria-label links, try href-only approach
+    # Strategy 2: Any href to /maps/place/ — extract name from URL
     if not listings:
         href_re = re.compile(r'href="(/maps/place/([^/]+)/[^"]*)"', re.I)
         for match in href_re.finditer(html):
             path = match.group(1)
-            name = match.group(2).replace("+", " ")
-            maps_url = "https://www.google.com" + path
+            name = match.group(2).replace("+", " ").replace("%20", " ")
+            _add_listing(listings, seen_urls, path, name)
 
-            if maps_url in seen_urls:
-                continue
-            seen_urls.add(maps_url)
+    # Strategy 3: Look for place URLs anywhere in the HTML (not just href)
+    if not listings:
+        url_re = re.compile(r'/maps/place/([^/"]+)/[^"\s<>]+', re.I)
+        for match in url_re.finditer(html):
+            path = match.group(0)
+            name = match.group(1).replace("+", " ").replace("%20", " ")
+            _add_listing(listings, seen_urls, path, name)
 
-            lat, lng = None, None
-            coord_match = _COORD_RE.search(path)
-            if coord_match:
-                lat = float(coord_match.group(1))
-                lng = float(coord_match.group(2))
-
-            place_id = ""
-            pid_match = _PLACE_ID_RE.search(path)
-            if pid_match:
-                place_id = pid_match.group(0)
-
-            listings.append({
-                "name": name.strip(),
-                "maps_url": maps_url,
-                "latitude": lat,
-                "longitude": lng,
-                "place_id": place_id,
-            })
-
+    log.info(f"Parsed {len(listings)} listings from HTML ({len(html)} chars)")
     return listings
+
+
+def _add_listing(listings: list, seen_urls: set, path: str, name: str):
+    """Helper to add a listing, avoiding duplicates."""
+    if not path.startswith("http"):
+        maps_url = "https://www.google.com" + path
+    else:
+        maps_url = path
+
+    # Deduplicate by place name (URLs may differ slightly)
+    dedup_key = maps_url.split("?")[0].split("!")[0]
+    if dedup_key in seen_urls:
+        return
+    seen_urls.add(dedup_key)
+
+    lat, lng = None, None
+    coord_match = _COORD_RE.search(path)
+    if coord_match:
+        lat = float(coord_match.group(1))
+        lng = float(coord_match.group(2))
+
+    place_id = ""
+    pid_match = _PLACE_ID_RE.search(path)
+    if pid_match:
+        place_id = pid_match.group(0)
+
+    # URL-decode the name
+    from urllib.parse import unquote
+    name = unquote(name).strip()
+
+    listings.append({
+        "name": name,
+        "maps_url": maps_url,
+        "latitude": lat,
+        "longitude": lng,
+        "place_id": place_id,
+    })
 
 
 def _parse_listing_detail(html: str, md: str, maps_url: str) -> dict:

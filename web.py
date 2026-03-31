@@ -726,6 +726,27 @@ def api_backup_detail(filename):
     )
 
 
+@app.get("/api/maps-debug")
+def api_maps_debug():
+    """Return the last Maps HTML dump for debugging parsing issues."""
+    for p in [Path("/data/debug/maps_debug.html"), Path("/tmp/maps_debug.html")]:
+        if p.exists():
+            html = p.read_text()
+            # Return a summary: first 2000 chars + all href patterns
+            import re
+            hrefs = re.findall(r'href="([^"]*maps/place[^"]*)"', html)
+            aria_labels = re.findall(r'aria-label="([^"]{5,80})"', html)
+            return jsonify(
+                html_length=len(html),
+                first_2000=html[:2000],
+                place_hrefs=hrefs[:20],
+                aria_labels=aria_labels[:30],
+                has_feed=('role="feed"' in html),
+                has_consent=('consent' in html.lower()),
+            )
+    return jsonify(error="No debug HTML found — run a Maps scrape first"), 404
+
+
 @app.post("/api/cancel/<job_id>")
 def api_cancel(job_id):
     job = jobs.get(job_id)
