@@ -131,6 +131,14 @@ def extract_emails(text: str) -> list[str]:
     return sorted(emails)
 
 
+_MAILTO_RE = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', re.I)
+
+
+def extract_mailto_emails(html: str) -> list[str]:
+    """Extract email addresses from mailto: href attributes in raw HTML."""
+    return [m.lower() for m in _MAILTO_RE.findall(html)]
+
+
 def extract_phones(text: str) -> list[str]:
     phones = []
     seen_digits = set()
@@ -1323,7 +1331,9 @@ async def scrape_lead(
     html = str(result.html) if result.html else ""
     md = str(result.markdown) if result.markdown else ""
 
-    emails = extract_emails(md)
+    # Extract emails from both markdown text and mailto: links in HTML
+    mailto_text = " ".join(extract_mailto_emails(html))
+    emails = extract_emails(md + " " + mailto_text)
     extra_md = ""
 
     # Try sub-pages if no emails found on main page
@@ -1341,7 +1351,7 @@ async def scrape_lead(
     combined_md = md + "\n" + extra_md if extra_md else md
 
     if extra_md:
-        emails = extract_emails(combined_md)
+        emails = extract_emails(combined_md + " " + mailto_text)
 
     structured = extract_structured_data(html)
 

@@ -234,96 +234,114 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
         job.log(f"Error: {e}", "error")
 
 
+def _map_source_record(rec: dict) -> dict:
+    """Normalize an imported record to our lead schema, preserving all source data."""
+    url = (rec.get("website") or rec.get("url") or "").strip()
+    if url and not url.startswith("https://www.google.com/maps"):
+        url = normalize_url(url)
+    else:
+        url = ""
+
+    phone = rec.get("phone") or rec.get("phoneUnformatted") or ""
+    parts = [rec.get("street", ""), rec.get("city", ""), rec.get("postalCode", "")]
+    addr = ", ".join(p for p in parts if p) or rec.get("address", "")
+
+    return {
+        "url": url,
+        "company": rec.get("title") or rec.get("name") or "",
+        "description": rec.get("description", ""),
+        "emails": [],
+        "phones": [phone] if phone else [],
+        "address": addr,
+        "socials": {},
+        "hours": rec.get("openingHours", "") or "",
+        "category": rec.get("categoryName", ""),
+        "rating": rec.get("totalScore"),
+        "google_rating": rec.get("totalScore"),
+        "google_reviews": rec.get("reviewsCount"),
+        "neighborhood": rec.get("neighborhood", ""),
+    }
+
+
+def _merge_enrichment(result: dict, scraped: dict):
+    """Overlay scraped website data onto a source record."""
+    if scraped.get("emails"):
+        result["emails"] = sorted(set(result.get("emails", []) + scraped["emails"]))
+    if scraped.get("socials"):
+        merged_socials = dict(result.get("socials", {}))
+        merged_socials.update(scraped["socials"])
+        result["socials"] = merged_socials
+    if scraped.get("hours") and not result.get("hours"):
+        result["hours"] = scraped["hours"]
+    if scraped.get("description") and not result.get("description"):
+        result["description"] = scraped["description"]
+    if scraped.get("company") and not result.get("company"):
+        result["company"] = scraped["company"]
+    if scraped.get("phones") and not result.get("phones"):
+        result["phones"] = scraped["phones"]
+    if scraped.get("address") and not result.get("address"):
+        result["address"] = scraped["address"]
+
+
 def _run_import_job(job: Job, records: list[dict]):
     """Scrape URLs from imported data (e.g. Google Maps export) and merge results."""
     try:
         cfg = _make_config(job.input_config)
 
-        # Extract website URLs from records, keeping the source data for merging
-        url_to_record: dict[str, dict] = {}
+        # Collect unique website URLs for scraping
+        urls_to_scrape: list[str] = []
+        seen_urls: set[str] = set()
         for rec in records:
-            url = rec.get("website") or rec.get("url") or ""
-            url = url.strip()
+            url = (rec.get("website") or rec.get("url") or "").strip()
             if not url or url.startswith("https://www.google.com/maps"):
                 continue
             url = normalize_url(url)
-            if url not in url_to_record:
-                url_to_record[url] = rec
+            if url not in seen_urls:
+                seen_urls.add(url)
+                urls_to_scrape.append(url)
 
-        urls = list(url_to_record.keys())
-        if not urls:
+        job.log(f"Imported {len(records)} records, {len(urls_to_scrape)} have scrapable websites")
+
+        # Scrape websites for enrichment (if any)
+        scraped_by_url: dict[str, dict] = {}
+        if urls_to_scrape:
             with job.lock:
-                job.status = "done"
-                job.progress_pct = 100
-                job.progress_msg = "No website URLs found in imported data."
-                job.finished_at = time.time()
-            job.log("No website URLs found in imported data", "warn")
-            return
+                job.status = "scraping"
+                job.progress_msg = f"Scraping {len(urls_to_scrape)} websites for enrichment..."
+            if cfg.stealth:
+                job.log("Stealth mode: enabled")
+            if cfg.crawl_depth >= 1:
+                job.log("Deep crawl: enabled")
 
-        with job.lock:
-            job.status = "scraping"
-            job.progress_msg = f"Scraping {len(urls)} URLs from imported data..."
-        job.log(f"Found {len(urls)} website URLs from {len(records)} imported records")
-        if cfg.stealth:
-            job.log("Stealth mode: enabled")
-        if cfg.crawl_depth >= 1:
-            job.log("Deep crawl: enabled")
+            def scrape_progress(i, total, msg):
+                if job.cancel_flag:
+                    raise InterruptedError("Cancelled")
+                with job.lock:
+                    job.progress_pct = int((i / max(total, 1)) * 100)
+                    job.progress_msg = msg
+                job.log(msg)
 
-        def scrape_progress(i, total, msg):
-            if job.cancel_flag:
-                raise InterruptedError("Cancelled")
-            with job.lock:
-                job.progress_pct = int((i / max(total, 1)) * 100)
-                job.progress_msg = msg
-            job.log(msg)
+            leads = asyncio.run(scrape_all(urls_to_scrape, on_progress=scrape_progress, config=cfg))
+            for lead in leads:
+                if "error" not in lead:
+                    scraped_by_url[lead.get("url", "")] = lead
 
-        leads = asyncio.run(scrape_all(urls, on_progress=scrape_progress, config=cfg))
-
-        # Merge: use imported data as base, overlay scraped data on top
+        # Build final results from ALL original records
         merged = []
-        for lead in leads:
-            url = lead.get("url", "")
-            source = url_to_record.get(url, {})
-
-            # Start with scraped data
-            result = dict(lead)
-
-            # Fill in gaps from source data (Google Maps fields)
-            if not result.get("company") or result["company"] == urlparse(url).netloc:
-                result["company"] = source.get("title") or result.get("company", "")
-
-            if not result.get("address"):
-                # Build address from source fields
-                parts = [source.get("street", ""), source.get("city", ""), source.get("postalCode", "")]
-                addr = ", ".join(p for p in parts if p)
-                result["address"] = addr or source.get("address", "")
-
-            if not result.get("phones"):
-                phone = source.get("phone") or source.get("phoneUnformatted", "")
-                if phone:
-                    result["phones"] = [phone]
-
-            # Add Maps-specific fields
-            if source.get("categoryName"):
-                result["category"] = source["categoryName"]
-            if source.get("totalScore"):
-                result["rating"] = source["totalScore"]
-            if source.get("neighborhood"):
-                result["neighborhood"] = source["neighborhood"]
-            if source.get("reviewsCount") and not result.get("google_reviews"):
-                result["google_reviews"] = source["reviewsCount"]
-            if source.get("totalScore") and not result.get("google_rating"):
-                result["google_rating"] = source["totalScore"]
-
+        for rec in records:
+            result = _map_source_record(rec)
+            if result["url"] and result["url"] in scraped_by_url:
+                _merge_enrichment(result, scraped_by_url[result["url"]])
             merged.append(result)
 
+        enriched_count = sum(1 for r in merged if r.get("emails") or r.get("socials"))
         with job.lock:
             job.status = "done"
             job.progress_pct = 100
             job.results = merged
-            job.progress_msg = f"Done — {len(merged)} leads enriched."
+            job.progress_msg = f"Done — {len(merged)} leads ({enriched_count} enriched with emails/socials)."
             job.finished_at = time.time()
-        job.log(f"Completed: {len(merged)} leads enriched in {job.duration:.1f}s")
+        job.log(f"Completed: {len(merged)} leads ({enriched_count} enriched) in {job.duration:.1f}s")
         _save_backup(job)
 
     except InterruptedError:
