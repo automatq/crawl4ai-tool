@@ -258,7 +258,6 @@ def render_template(template: str, lead: dict, sender: dict) -> str:
         return template.format(
             company_name=lead.get("company", "your company"),
             city=lead.get("city", lead.get("address", "")),
-            sender_name=sender.get("name", ""),
             sender_email=sender.get("email", ""),
             sender_phone=sender.get("phone", ""),
             sender_company=sender.get("company", ""),
@@ -468,13 +467,13 @@ async def _submit_one(
         if ftype == "email":
             field_map[selector] = (sender.get("email", ""), tag)
         elif ftype == "name":
-            field_map[selector] = (sender.get("name", ""), tag)
+            field_map[selector] = (sender.get("company", ""), tag)
         elif ftype == "phone":
             field_map[selector] = (sender.get("phone", ""), tag)
         elif ftype == "company":
             field_map[selector] = (sender.get("company", ""), tag)
         elif ftype == "subject":
-            subject = f"Partnership inquiry for {lead.get('company', 'your business')}"
+            subject = f"AI Automation Inquiry — {sender.get('company', 'AxiomFlow')}"
             field_map[selector] = (subject, tag)
         elif ftype == "message":
             field_map[selector] = (message, tag)

@@ -106,7 +106,6 @@ $("#start-btn").addEventListener("click", async () => {
     concurrency: parseInt($("#opt-concurrency").value) || 3,
     proxies: $("#opt-proxies").value.trim(),
     outreach_enabled: $("#opt-outreach").checked,
-    sender_name: $("#sender-name").value.trim(),
     sender_email: $("#sender-email").value.trim(),
     sender_phone: $("#sender-phone").value.trim(),
     sender_company: $("#sender-company").value.trim(),
