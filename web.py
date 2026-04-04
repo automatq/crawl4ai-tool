@@ -21,6 +21,7 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 from gmaps import scrape_google_maps
+from outreach import run_outreach
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
@@ -149,6 +150,66 @@ def _make_config(input_config: dict) -> ScrapeConfig:
     )
 
 
+def _run_outreach_phase(job: Job, leads: list[dict], cfg: ScrapeConfig) -> list[dict]:
+    """Run outreach on leads without emails, if enabled. Returns updated leads list."""
+    ic = job.input_config
+    if not ic.get("outreach_enabled"):
+        return leads
+
+    sender = {
+        "name": ic.get("sender_name", ""),
+        "email": ic.get("sender_email", ""),
+        "phone": ic.get("sender_phone", ""),
+        "company": ic.get("sender_company", ""),
+    }
+    template = ic.get("message_template", "")
+    if not sender.get("email") or not template:
+        job.log("Outreach skipped: sender email and message template required", "warn")
+        return leads
+
+    no_email = [l for l in leads if not l.get("emails") and l.get("url") and "error" not in l]
+    if not no_email:
+        job.log("Outreach skipped: all leads already have emails")
+        return leads
+
+    job.log(f"Starting outreach for {len(no_email)} leads without emails...")
+    with job.lock:
+        job.status = "outreach"
+        job.progress_msg = f"Submitting contact forms for {len(no_email)} leads..."
+
+    def outreach_progress(i, total, msg):
+        if job.cancel_flag:
+            raise InterruptedError("Cancelled")
+        with job.lock:
+            job.progress_pct = 80 + int((i / max(total, 1)) * 20)
+            job.progress_msg = msg
+        job.log(msg)
+
+    outreach_results = asyncio.run(
+        run_outreach(no_email, sender, template, cfg, on_progress=outreach_progress)
+    )
+
+    # Merge outreach results back by URL
+    outreach_by_url = {r["url"]: r for r in outreach_results}
+    merged = []
+    for lead in leads:
+        url = lead.get("url", "")
+        if url in outreach_by_url:
+            merged.append(outreach_by_url[url])
+        else:
+            merged.append(lead)
+
+    # Log summary
+    statuses = {}
+    for r in outreach_results:
+        s = r.get("outreach_status", "unknown")
+        statuses[s] = statuses.get(s, 0) + 1
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(statuses.items()))
+    job.log(f"Outreach complete: {summary}")
+
+    return merged
+
+
 def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
     try:
         cfg = _make_config(job.input_config)
@@ -204,11 +265,16 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             if job.cancel_flag:
                 raise InterruptedError("Cancelled")
             with job.lock:
-                job.progress_pct = 45 + int((i / max(total, 1)) * 55)
+                pct = 45 + int((i / max(total, 1)) * 35) if job.input_config.get("outreach_enabled") else 45 + int((i / max(total, 1)) * 55)
+                job.progress_pct = pct
                 job.progress_msg = msg
             job.log(msg)
 
         leads = asyncio.run(scrape_all(urls, on_progress=scrape_progress, config=cfg))
+        job.log(f"Scraping complete: {len(leads)} leads in {job.duration:.1f}s")
+
+        # Outreach phase (if enabled)
+        leads = _run_outreach_phase(job, leads, cfg)
 
         with job.lock:
             job.status = "done"
@@ -216,7 +282,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.results = leads
             job.progress_msg = f"Done — {len(leads)} leads scraped."
             job.finished_at = time.time()
-        job.log(f"Completed: {len(leads)} leads scraped in {job.duration:.1f}s")
+        job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
 
     except InterruptedError:
@@ -334,6 +400,9 @@ def _run_import_job(job: Job, records: list[dict]):
                 _merge_enrichment(result, scraped_by_url[result["url"]])
             merged.append(result)
 
+        # Outreach phase (if enabled)
+        merged = _run_outreach_phase(job, merged, cfg)
+
         enriched_count = sum(1 for r in merged if r.get("emails") or r.get("socials"))
         with job.lock:
             job.status = "done"
@@ -401,6 +470,13 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
             job.results = leads
             job.progress_msg = f"Done — {len(leads)} leads from Google Maps."
             job.finished_at = time.time()
+
+        # Outreach phase (if enabled)
+        leads = _run_outreach_phase(job, leads, cfg)
+        with job.lock:
+            job.results = leads
+            job.finished_at = time.time()
+
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
 
@@ -441,6 +517,9 @@ def _run_url_job(job: Job, urls: list[str]):
             job.log(msg)
 
         leads = asyncio.run(scrape_all(urls, on_progress=scrape_progress, config=cfg))
+
+        # Outreach phase (if enabled)
+        leads = _run_outreach_phase(job, leads, cfg)
 
         with job.lock:
             job.status = "done"

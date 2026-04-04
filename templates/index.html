@@ -144,6 +144,39 @@
             <textarea id="opt-proxies" rows="3" placeholder="http://proxy1:8080&#10;http://user:pass@proxy2:8080&#10;One per line"></textarea>
             <small>Rotate through proxy servers to avoid IP blocks</small>
           </div>
+          <hr style="border:none;border-top:1px solid var(--border);margin:12px 0">
+          <div class="option-row">
+            <label class="toggle-label">
+              <input type="checkbox" id="opt-outreach">
+              <span>Auto-outreach</span>
+            </label>
+            <small>Submit contact forms for leads without emails after scraping</small>
+          </div>
+          <div id="outreach-fields" hidden>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+              <div class="field">
+                <label for="sender-name">Your name</label>
+                <input type="text" id="sender-name" placeholder="Chris">
+              </div>
+              <div class="field">
+                <label for="sender-email">Your email</label>
+                <input type="email" id="sender-email" placeholder="chris@automatq.com">
+              </div>
+              <div class="field">
+                <label for="sender-phone">Your phone</label>
+                <input type="tel" id="sender-phone" placeholder="(555) 123-4567">
+              </div>
+              <div class="field">
+                <label for="sender-company">Your company</label>
+                <input type="text" id="sender-company" placeholder="Automatq">
+              </div>
+            </div>
+            <div class="field" style="margin-top:8px">
+              <label for="message-template">Message template</label>
+              <textarea id="message-template" rows="4" placeholder="Hi {company_name}, I'm {sender_name} from {sender_company}. We help businesses like yours with AI automation..."></textarea>
+              <small>Variables: <code>{company_name}</code> <code>{city}</code> <code>{sender_name}</code> <code>{sender_email}</code> <code>{sender_phone}</code> <code>{sender_company}</code></small>
+            </div>
+          </div>
         </div>
       </details>
 
@@ -227,6 +260,7 @@
               <th data-col="google_rating" class="sortable">Rating</th>
               <th data-col="price_level" class="sortable">Price</th>
               <th data-col="socials">Socials</th>
+              <th data-col="outreach_status" class="sortable">Outreach</th>
               <th data-col="maps_url">Maps</th>
             </tr>
           </thead>
