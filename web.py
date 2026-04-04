@@ -157,7 +157,6 @@ def _run_outreach_phase(job: Job, leads: list[dict], cfg: ScrapeConfig) -> list[
         return leads
 
     sender = {
-        "name": ic.get("sender_name", ""),
         "email": ic.get("sender_email", ""),
         "phone": ic.get("sender_phone", ""),
         "company": ic.get("sender_company", ""),
