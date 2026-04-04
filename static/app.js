@@ -87,6 +87,12 @@ function handleFile(file) {
   reader.readAsText(file);
 }
 
+// ── Outreach toggle ──────────────────────────────────────────────────
+
+$("#opt-outreach").addEventListener("change", () => {
+  $("#outreach-fields").hidden = !$("#opt-outreach").checked;
+});
+
 // ── Start run ────────────────────────────────────────────────────────
 
 $("#start-btn").addEventListener("click", async () => {
@@ -99,6 +105,12 @@ $("#start-btn").addEventListener("click", async () => {
     deep_crawl: $("#opt-deep-crawl").checked,
     concurrency: parseInt($("#opt-concurrency").value) || 3,
     proxies: $("#opt-proxies").value.trim(),
+    outreach_enabled: $("#opt-outreach").checked,
+    sender_name: $("#sender-name").value.trim(),
+    sender_email: $("#sender-email").value.trim(),
+    sender_phone: $("#sender-phone").value.trim(),
+    sender_company: $("#sender-company").value.trim(),
+    message_template: $("#message-template").value.trim(),
   };
 
   if (currentMode === "keyword") {
@@ -214,6 +226,7 @@ function connectSSE(jobId) {
     // Status updates
     if (data.status === "searching") setStatus("searching");
     else if (data.status === "scraping") setStatus("scraping");
+    else if (data.status === "outreach") setStatus("outreach");
 
     // Terminal states
     if (data.status === "done" || data.status === "error" || data.status === "cancelled") {
@@ -271,7 +284,7 @@ function renderResults(data) {
     const tr = document.createElement("tr");
     if (lead.error) {
       tr.className = "error-row";
-      tr.innerHTML = `<td colspan="12">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
+      tr.innerHTML = `<td colspan="13">Error: ${esc(lead.error)} — ${esc(lead.url)}</td>`;
     } else {
       const emails = (lead.emails || []).join("; ");
       const phones = (lead.phones || []).join("; ");
@@ -293,6 +306,7 @@ function renderResults(data) {
         <td class="cell-copy" title="Click to copy">${lead.google_rating != null ? esc(String(lead.google_rating)) : ""}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.price_level || "")}</td>
         <td class="cell-socials">${socials}</td>
+        <td class="cell-outreach" title="${esc(lead.outreach_detail || "")}">${outreachBadge(lead.outreach_status)}</td>
         <td>${mapsDisplay}</td>
       `;
       tr.querySelectorAll(".cell-copy").forEach((td) => {
@@ -405,12 +419,12 @@ function addLog(msg, level = "info") {
 function setStatus(status) {
   const labels = {
     idle: "Idle", pending: "Pending", running: "Running",
-    searching: "Searching", scraping: "Scraping",
+    searching: "Searching", scraping: "Scraping", outreach: "Outreach",
     done: "Succeeded", error: "Failed", cancelled: "Cancelled",
   };
   const colors = {
     idle: "badge-idle", pending: "badge-pending", running: "badge-running",
-    searching: "badge-running", scraping: "badge-running",
+    searching: "badge-running", scraping: "badge-running", outreach: "badge-running",
     done: "badge-success", error: "badge-error", cancelled: "badge-cancelled",
   };
 
@@ -464,6 +478,20 @@ function esc(str) {
   const d = document.createElement("div");
   d.textContent = str || "";
   return d.innerHTML;
+}
+
+function outreachBadge(status) {
+  if (!status) return "";
+  const colors = {
+    submitted: "#16a34a",
+    captcha_blocked: "#ca8a04",
+    no_form_found: "#9ca3af",
+    skipped: "#9ca3af",
+    failed: "#dc2626",
+    error: "#dc2626",
+  };
+  const color = colors[status] || "#9ca3af";
+  return `<span style="color:${color};font-size:12px;font-weight:500">${esc(status)}</span>`;
 }
 
 function truncUrl(url) {
