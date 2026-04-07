@@ -92,6 +92,8 @@ function handleFile(file) {
 $("#maps-area-search").addEventListener("change", () => {
   const on = $("#maps-area-search").checked;
   $("#maps-area-fields").hidden = !on;
+  // Hide city field — polygon coordinates replace it
+  $("#maps-city-field").hidden = on;
   // Lift max results cap when area search is on
   const maxInput = $("#maps-max");
   if (on) {
@@ -146,6 +148,10 @@ $("#start-btn").addEventListener("click", async () => {
     const areaSearch = $("#maps-area-search").checked;
     if (!keyword) {
       showToast("Enter a business type to search for", "warn");
+      return;
+    }
+    if (!areaSearch && !city) {
+      showToast("Enter a location or enable area search with a polygon", "warn");
       return;
     }
     let polygonData = null;
