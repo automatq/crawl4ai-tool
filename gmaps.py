@@ -78,17 +78,37 @@ if (form) {
 }
 """
 
-# Scroll the results panel to load more listings
-SCROLL_JS = """
-// Scroll the results feed to load more items
-const feed = document.querySelector('div[role="feed"]');
-if (feed) {
-    feed.scrollTop = feed.scrollHeight;
-}
-// Count current items
-const links = document.querySelectorAll('a[href*="/maps/place/"]');
-links.length;
+# Extract listing data from live DOM into a hidden div for Python to parse
+EXTRACT_LISTINGS_JS = """
+(function() {
+  var feed = document.querySelector('div[role="feed"]');
+  var container = feed || document;
+  var anchors = container.querySelectorAll('a[href*="/maps/place/"]');
+  var listings = [];
+  var seen = {};
+  for (var i = 0; i < anchors.length; i++) {
+    var a = anchors[i];
+    var href = a.href;
+    if (seen[href]) continue;
+    seen[href] = true;
+    listings.push({ href: href, name: a.getAttribute('aria-label') || '' });
+  }
+  var el = document.getElementById('__gmaps_listings__');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = '__gmaps_listings__';
+    el.style.display = 'none';
+    document.body.appendChild(el);
+  }
+  el.textContent = JSON.stringify(listings);
+})();
 """
+
+# Scroll the results panel and extract listings
+SCROLL_JS = """
+const feed = document.querySelector('div[role="feed"]');
+if (feed) { feed.scrollTop = feed.scrollHeight; }
+""" + EXTRACT_LISTINGS_JS
 
 
 # ── Parsing helpers ──────────────────────────────────────────────────
@@ -110,6 +130,55 @@ _PLUS_CODE_RE = re.compile(
 )
 
 
+def _parse_listings_from_js_data(html: str) -> list[dict] | None:
+    """Try to extract listing data from the __gmaps_listings__ hidden div.
+
+    Returns a list of listing dicts if found, or None to signal fallback to regex.
+    """
+    marker = 'id="__gmaps_listings__"'
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+
+    # Find content between > and </div>
+    start = html.find(">", idx + len(marker))
+    if start == -1:
+        return None
+    start += 1
+    end = html.find("</div>", start)
+    if end == -1:
+        return None
+
+    json_str = html[start:end].strip()
+    if not json_str:
+        return None
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        # crawl4ai may HTML-entity-encode the JSON
+        import html as html_mod
+        try:
+            data = json.loads(html_mod.unescape(json_str))
+        except (json.JSONDecodeError, Exception):
+            log.warning("Found __gmaps_listings__ div but could not parse JSON")
+            return None
+
+    if not isinstance(data, list):
+        return None
+
+    listings = []
+    seen_urls = set()
+    for item in data:
+        href = item.get("href", "")
+        name = item.get("name", "")
+        if not href or "/maps/place/" not in href:
+            continue
+        _add_listing(listings, seen_urls, href, name)
+
+    return listings if listings else None
+
+
 def _parse_listings_from_html(html: str) -> list[dict]:
     """Extract listing cards from the Maps search results page HTML."""
     listings = []
@@ -126,6 +195,13 @@ def _parse_listings_from_html(html: str) -> list[dict]:
     except Exception as e:
         log.warning(f"Could not save debug HTML: {e}")
 
+    # Primary strategy: extract from JS-injected JSON data in hidden div
+    js_listings = _parse_listings_from_js_data(html)
+    if js_listings:
+        log.info(f"Parsed {len(js_listings)} listings from JS extraction ({len(html)} chars)")
+        return js_listings
+
+    # Fallback: regex strategies on raw HTML
     # Strategy 1: aria-label on anchor tags
     link_re = re.compile(
         r'<a\s[^>]*?href="(/maps/place/[^"]+)"[^>]*?aria-label="([^"]*)"',
@@ -485,7 +561,7 @@ async def _scroll_and_collect(
         word_count_threshold=0,
         remove_overlay_elements=True,
         wait_until="domcontentloaded",
-        js_code=CONSENT_JS,
+        js_code=CONSENT_JS + "\n" + EXTRACT_LISTINGS_JS,
         delay_before_return_html=3.0,
     )
 
