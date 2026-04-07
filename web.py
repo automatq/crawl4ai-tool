@@ -20,7 +20,7 @@ from uuid import uuid4
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
-from gmaps import scrape_google_maps
+from gmaps import scrape_google_maps, scrape_google_maps_area
 from outreach import run_outreach
 
 app = Flask(__name__)
@@ -431,11 +431,18 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
     """Run a Google Maps scraping job."""
     try:
         cfg = _make_config(job.input_config)
+        ic = job.input_config
+        area_search = ic.get("area_search", False)
+        polygon = ic.get("polygon")
 
         with job.lock:
             job.status = "searching"
             job.progress_msg = f"Searching Google Maps for '{query}'..."
-        job.log(f"Starting Google Maps scrape: '{query}' (max {max_results})")
+        if area_search and polygon:
+            job.log(f"Starting polygon area search: '{ic.get('keyword', query)}' (max {max_results})")
+            job.log(f"Grid spacing: {ic.get('grid_spacing_km', 1.0)} km")
+        else:
+            job.log(f"Starting Google Maps scrape: '{query}' (max {max_results})")
         if cfg.stealth:
             job.log("Stealth mode: enabled")
         if cfg.proxies:
@@ -448,20 +455,30 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
                 raise InterruptedError("Cancelled")
             with job.lock:
                 if enrich:
-                    # 0-70% for Maps, 70-100% for enrichment
                     job.progress_pct = min(70, int((current / max(total, 1)) * 70))
                 else:
                     job.progress_pct = int((current / max(total, 1)) * 100)
                 job.progress_msg = msg
             job.log(msg)
 
-        leads = asyncio.run(scrape_google_maps(
-            query=query,
-            max_results=max_results,
-            enrich_websites=enrich,
-            config=cfg,
-            on_progress=maps_progress,
-        ))
+        if area_search and polygon:
+            leads = asyncio.run(scrape_google_maps_area(
+                keyword=ic.get("keyword", query),
+                polygon=polygon,
+                grid_spacing_km=float(ic.get("grid_spacing_km", 1.0)),
+                max_results=max_results,
+                enrich_websites=enrich,
+                config=cfg,
+                on_progress=maps_progress,
+            ))
+        else:
+            leads = asyncio.run(scrape_google_maps(
+                query=query,
+                max_results=max_results,
+                enrich_websites=enrich,
+                config=cfg,
+                on_progress=maps_progress,
+            ))
 
         with job.lock:
             job.status = "done"
@@ -595,7 +612,13 @@ def api_maps():
     keyword = data.get("keyword", "").strip()
     city = data.get("city", "").strip()
     query = data.get("query", "").strip()
-    max_results = min(int(data.get("max_results", 100)), 120)
+    area_search = data.get("area_search", False)
+    polygon = data.get("polygon")
+
+    # Area search allows up to 2000; normal search capped at 120
+    max_cap = 2000 if (area_search and polygon) else 120
+    max_results = min(int(data.get("max_results", 100)), max_cap)
+
     enrich = data.get("enrich_websites", False)
 
     if not query:
@@ -606,12 +629,18 @@ def api_maps():
         else:
             return jsonify(error="Keyword or query is required"), 400
 
+    if area_search and not polygon:
+        return jsonify(error="Polygon GeoJSON is required for area search"), 400
+
     job = _create_job(
-        mode="maps", query=query, max_results=max_results,
-        enrich_websites=enrich,
+        mode="maps", query=query, keyword=keyword, max_results=max_results,
+        enrich_websites=enrich, area_search=area_search, polygon=polygon,
+        grid_spacing_km=float(data.get("grid_spacing_km", 1.0)),
         stealth=data.get("stealth", True),
         proxies=data.get("proxies", ""),
         concurrency=int(data.get("concurrency", 2)),
+        **{k: data[k] for k in ("outreach_enabled", "sender_email", "sender_phone",
+                                  "sender_company", "message_template") if k in data},
     )
 
     _work_queue.put((_run_maps_job, (job, query, max_results, enrich)))

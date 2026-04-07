@@ -87,6 +87,22 @@ function handleFile(file) {
   reader.readAsText(file);
 }
 
+// ── Area search toggle ───────────────────────────────────────────────
+
+$("#maps-area-search").addEventListener("change", () => {
+  const on = $("#maps-area-search").checked;
+  $("#maps-area-fields").hidden = !on;
+  // Lift max results cap when area search is on
+  const maxInput = $("#maps-max");
+  if (on) {
+    maxInput.max = 2000;
+    if (parseInt(maxInput.value) <= 120) maxInput.value = 500;
+  } else {
+    maxInput.max = 120;
+    if (parseInt(maxInput.value) > 120) maxInput.value = 100;
+  }
+});
+
 // ── Outreach toggle ──────────────────────────────────────────────────
 
 $("#opt-outreach").addEventListener("change", () => {
@@ -127,12 +143,33 @@ $("#start-btn").addEventListener("click", async () => {
     const city = $("#maps-city").value.trim();
     const maxResults = parseInt($("#maps-max").value) || 100;
     const enrich = $("#maps-enrich").checked;
+    const areaSearch = $("#maps-area-search").checked;
     if (!keyword) {
       showToast("Enter a business type to search for", "warn");
       return;
     }
+    let polygonData = null;
+    if (areaSearch) {
+      const raw = $("#maps-polygon").value.trim();
+      if (!raw) {
+        showToast("Paste a GeoJSON polygon for area search", "warn");
+        return;
+      }
+      try {
+        polygonData = JSON.parse(raw);
+      } catch {
+        showToast("Invalid GeoJSON — check your polygon JSON", "error");
+        return;
+      }
+    }
     endpoint = "/api/maps";
-    payload = { keyword, city, max_results: maxResults, enrich_websites: enrich, ...advancedOpts };
+    payload = {
+      keyword, city, max_results: maxResults, enrich_websites: enrich,
+      area_search: areaSearch,
+      polygon: polygonData,
+      grid_spacing_km: parseFloat($("#maps-grid-spacing")?.value) || 1.0,
+      ...advancedOpts,
+    };
   } else if (currentMode === "import") {
     if (!importedData || !importedData.length) {
       showToast("Upload a JSON file first", "warn");
