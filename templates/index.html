@@ -85,6 +85,25 @@
           </label>
           <small>Visit each business website to extract emails and social links (slower but more data)</small>
         </div>
+        <div class="option-row">
+          <label class="toggle-label">
+            <input type="checkbox" id="maps-area-search">
+            <span>Area search (polygon grid)</span>
+          </label>
+          <small>Overcome the 120 result limit by splitting a polygon area into a grid of searches</small>
+        </div>
+        <div id="maps-area-fields" hidden>
+          <div class="field field-sm" style="margin-top:8px">
+            <label for="maps-grid-spacing">Grid spacing (km)</label>
+            <input type="number" id="maps-grid-spacing" value="1.0" min="0.5" max="5" step="0.5">
+            <small>Smaller = more thorough but slower. 1km recommended for cities.</small>
+          </div>
+          <div class="field" style="margin-top:8px">
+            <label for="maps-polygon">GeoJSON Polygon</label>
+            <textarea id="maps-polygon" rows="4" placeholder='Paste GeoJSON — draw a polygon at geojson.io and copy the JSON'></textarea>
+            <small>Go to <a href="https://geojson.io" target="_blank" rel="noopener">geojson.io</a>, draw your search area, copy the JSON</small>
+          </div>
+        </div>
       </div>
 
       <!-- URL form -->

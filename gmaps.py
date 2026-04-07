@@ -12,6 +12,7 @@ Optionally enriches results by visiting business websites for emails/socials.
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import time
@@ -388,6 +389,81 @@ def _parse_address_components(address: str, detail: dict):
         detail["city"] = parts[1]
 
 
+# ── Polygon geometry helpers (ported from gmaps-scraper/geometry.js) ──
+
+def _km_to_deg_lat(km: float) -> float:
+    """Convert km to degrees latitude (constant everywhere)."""
+    return km / 111.32
+
+
+def _km_to_deg_lng(km: float, lat: float) -> float:
+    """Convert km to degrees longitude (varies with latitude)."""
+    return km / (111.32 * math.cos(math.radians(lat)))
+
+
+def _point_in_polygon(lng: float, lat: float, ring: list) -> bool:
+    """Ray-casting: is (lng, lat) inside a polygon ring? Ring is [[lng, lat], ...]."""
+    x, y = lng, lat
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > y) != (yj > y) and x < ((xj - xi) * (y - yi)) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _get_polygon_rings(geojson: dict) -> list:
+    """Extract outer rings from GeoJSON Polygon or MultiPolygon."""
+    if not geojson:
+        return []
+    gtype = geojson.get("type", "")
+    if gtype == "Polygon":
+        return [geojson["coordinates"][0]]
+    if gtype == "MultiPolygon":
+        return [poly[0] for poly in geojson["coordinates"]]
+    # Handle FeatureCollection or Feature wrapper
+    if gtype == "Feature" and geojson.get("geometry"):
+        return _get_polygon_rings(geojson["geometry"])
+    if gtype == "FeatureCollection":
+        for feature in geojson.get("features", []):
+            rings = _get_polygon_rings(feature.get("geometry", {}))
+            if rings:
+                return rings
+    return []
+
+
+def _generate_grid_points(geojson: dict, spacing_km: float = 1.0) -> list[dict]:
+    """Generate {lat, lng} grid points inside a GeoJSON polygon."""
+    rings = _get_polygon_rings(geojson)
+    if not rings:
+        raise ValueError("No valid polygon rings found in GeoJSON")
+
+    points = []
+    for ring in rings:
+        lngs = [p[0] for p in ring]
+        lats = [p[1] for p in ring]
+        min_lng, max_lng = min(lngs), max(lngs)
+        min_lat, max_lat = min(lats), max(lats)
+        mid_lat = (min_lat + max_lat) / 2
+
+        lat_step = _km_to_deg_lat(spacing_km)
+        lng_step = _km_to_deg_lng(spacing_km, mid_lat)
+
+        lat = min_lat
+        while lat <= max_lat:
+            lng = min_lng
+            while lng <= max_lng:
+                if _point_in_polygon(lng, lat, ring):
+                    points.append({"lat": round(lat, 7), "lng": round(lng, 7)})
+                lng += lng_step
+            lat += lat_step
+
+    return points
+
+
 # ── Main scraping functions ──────────────────────────────────────────
 
 async def _scroll_and_collect(
@@ -724,4 +800,253 @@ async def scrape_google_maps(
 
     progress(len(output), len(output),
              f"Done — {len(output)} leads from Google Maps")
+    return output
+
+
+# ── Shared detail/enrichment pipeline ────────────────────────────────
+
+async def _scrape_details_and_enrich(
+    crawler: AsyncWebCrawler,
+    listings: list[dict],
+    max_results: int,
+    enrich_websites: bool,
+    config: ScrapeConfig,
+    rate_limiter: DomainRateLimiter,
+    progress: Callable,
+) -> list[dict]:
+    """Scrape detail pages and optionally enrich with website data.
+
+    Shared between scrape_google_maps() and scrape_google_maps_area().
+    """
+    sem = asyncio.Semaphore(config.concurrency)
+
+    async def scrape_one(i: int, listing: dict) -> dict:
+        async with sem:
+            progress(i, len(listings), f"[{i+1}/{len(listings)}] {listing['name']}")
+            detail = await _scrape_detail_page(crawler, listing["maps_url"], rate_limiter)
+            lead = {**listing, **detail}
+            for key, default in [
+                ("category", ""), ("address", ""), ("phone", ""), ("website", ""),
+                ("rating", None), ("review_count", None), ("review_distribution", {}),
+                ("hours", ""), ("price_level", ""), ("latitude", None), ("longitude", None),
+                ("place_id", ""), ("plus_code", ""), ("is_temporarily_closed", False),
+                ("is_permanently_closed", False), ("description", ""), ("thumbnail_url", ""),
+                ("emails", []), ("socials", {}),
+            ]:
+                lead.setdefault(key, default)
+            return lead
+
+    tasks = [scrape_one(i, l) for i, l in enumerate(listings)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    good_leads = []
+    for i, lead in enumerate(results):
+        if isinstance(lead, Exception):
+            progress(i + 1, len(listings), f"Error: {lead}")
+            continue
+        good_leads.append(lead)
+
+    progress(len(good_leads), len(listings),
+             f"Scraped {len(good_leads)} listings from Maps")
+
+    # Website enrichment
+    if enrich_websites:
+        with_websites = [l for l in good_leads if l.get("website")]
+        if with_websites:
+            progress(0, len(with_websites), "Enriching with website data...")
+
+            async def enrich_one(i: int, lead: dict) -> dict:
+                async with sem:
+                    progress(i, len(with_websites),
+                             f"[{i+1}/{len(with_websites)}] Enriching {lead['name']}...")
+                    return await _enrich_with_website(lead, crawler, rate_limiter, config)
+
+            enrich_tasks = [enrich_one(i, l) for i, l in enumerate(with_websites)]
+            enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+
+            enriched_map = {}
+            for i, result in enumerate(enriched):
+                if not isinstance(result, Exception):
+                    enriched_map[with_websites[i]["maps_url"]] = result
+
+            for j, lead in enumerate(good_leads):
+                if lead["maps_url"] in enriched_map:
+                    good_leads[j] = enriched_map[lead["maps_url"]]
+
+            progress(len(with_websites), len(with_websites),
+                     f"Enriched {len(enriched_map)} leads with website data")
+
+    return good_leads
+
+
+def _format_leads(leads: list[dict]) -> list[dict]:
+    """Rename fields to match the app's convention."""
+    output = []
+    for lead in leads:
+        out = {
+            "company": lead.get("name", ""),
+            "url": lead.get("website", ""),
+            "maps_url": lead.get("maps_url", ""),
+            "category": lead.get("category", ""),
+            "description": lead.get("description", ""),
+            "emails": lead.get("emails", []),
+            "phones": [lead["phone"]] if lead.get("phone") else [],
+            "address": lead.get("address", ""),
+            "city": lead.get("city", ""),
+            "state": lead.get("state", ""),
+            "zip_code": lead.get("zip_code", ""),
+            "hours": lead.get("hours", ""),
+            "google_rating": lead.get("rating"),
+            "google_reviews": lead.get("review_count"),
+            "review_distribution": lead.get("review_distribution", {}),
+            "price_level": lead.get("price_level", ""),
+            "latitude": lead.get("latitude"),
+            "longitude": lead.get("longitude"),
+            "place_id": lead.get("place_id", ""),
+            "plus_code": lead.get("plus_code", ""),
+            "is_temporarily_closed": lead.get("is_temporarily_closed", False),
+            "is_permanently_closed": lead.get("is_permanently_closed", False),
+            "thumbnail_url": lead.get("thumbnail_url", ""),
+            "socials": lead.get("socials", {}),
+        }
+        output.append(out)
+    return output
+
+
+# ── Polygon area search ──────────────────────────────────────────────
+
+async def scrape_google_maps_area(
+    keyword: str,
+    polygon: dict,
+    grid_spacing_km: float = 1.0,
+    max_results: int = 500,
+    enrich_websites: bool = False,
+    config: ScrapeConfig | None = None,
+    on_progress: Callable | None = None,
+) -> list[dict]:
+    """Search Google Maps across a polygon grid to overcome the 120-result cap.
+
+    Args:
+        keyword: Business type, e.g. "plumber"
+        polygon: GeoJSON Polygon, MultiPolygon, Feature, or FeatureCollection
+        grid_spacing_km: Distance between grid search points in km
+        max_results: Maximum total results (cap across all grid cells)
+        enrich_websites: Visit business websites for emails/socials
+        config: Scraping configuration
+        on_progress: Callback(current, total, message)
+
+    Returns:
+        List of lead dicts (same format as scrape_google_maps).
+    """
+    config = config or ScrapeConfig()
+    browser_config = _make_maps_browser_config(config)
+    rate_limiter = DomainRateLimiter(min_delay=3.0)
+
+    def progress(current, total, msg):
+        if on_progress:
+            on_progress(current, total, msg)
+
+    # Generate grid points
+    grid_points = _generate_grid_points(polygon, grid_spacing_km)
+    if not grid_points:
+        progress(0, 0, "No grid points generated — check your polygon")
+        return []
+
+    polygon_rings = _get_polygon_rings(polygon)
+    total_cells = len(grid_points)
+    progress(0, total_cells, f"Grid: {total_cells} search cells for '{keyword}'")
+
+    if total_cells > 500:
+        progress(0, total_cells, f"Warning: {total_cells} cells is very large — consider increasing grid spacing")
+
+    # Phase 1: Scroll each grid cell, collect all unique listings
+    seen_place_ids: set[str] = set()
+    seen_urls: set[str] = set()
+    all_listings: list[dict] = []
+
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        for cell_i, point in enumerate(grid_points):
+            if len(all_listings) >= max_results:
+                progress(cell_i, total_cells,
+                         f"Reached {max_results} max results, stopping grid search")
+                break
+
+            search_url = (
+                f"https://www.google.com/maps/search/"
+                f"{quote_plus(keyword)}/@{point['lat']},{point['lng']},15z"
+            )
+
+            progress(cell_i, total_cells,
+                     f"Cell {cell_i+1}/{total_cells}: searching @ {point['lat']:.4f},{point['lng']:.4f}")
+
+            # Reuse scroll_and_collect with reduced scrolling for smaller areas
+            html = await _scroll_and_collect(
+                crawler, search_url, max_results=120, rate_limiter=rate_limiter,
+            )
+
+            if html:
+                cell_listings = _parse_listings_from_html(html)
+                new_count = 0
+                for listing in cell_listings:
+                    # Deduplicate by place_id (primary) or URL (fallback)
+                    pid = listing.get("place_id", "")
+                    url_key = listing["maps_url"].split("?")[0].split("!")[0]
+
+                    if pid and pid in seen_place_ids:
+                        continue
+                    if url_key in seen_urls:
+                        continue
+
+                    if pid:
+                        seen_place_ids.add(pid)
+                    seen_urls.add(url_key)
+                    all_listings.append(listing)
+                    new_count += 1
+
+                    if len(all_listings) >= max_results:
+                        break
+
+                progress(cell_i + 1, total_cells,
+                         f"Cell {cell_i+1}/{total_cells}: +{new_count} new ({len(all_listings)} unique total)")
+
+            # Random delay between cells
+            if cell_i < total_cells - 1:
+                delay = random.uniform(3, 8)
+                await asyncio.sleep(delay)
+
+        progress(total_cells, total_cells,
+                 f"Grid search complete: {len(all_listings)} unique listings from {total_cells} cells")
+
+        if not all_listings:
+            progress(0, 0, "No listings found in polygon area")
+            return []
+
+        # Phase 2: Scrape detail pages + enrichment
+        good_leads = await _scrape_details_and_enrich(
+            crawler, all_listings, max_results, enrich_websites,
+            config, rate_limiter, progress,
+        )
+
+    # Phase 3: Post-filter by polygon boundary
+    if polygon_rings:
+        filtered = []
+        for lead in good_leads:
+            lat = lead.get("latitude")
+            lng = lead.get("longitude")
+            if lat is not None and lng is not None:
+                inside = any(_point_in_polygon(lng, lat, ring) for ring in polygon_rings)
+                if not inside:
+                    log.debug(f"Outside polygon, dropping: {lead.get('name')} ({lat},{lng})")
+                    continue
+            filtered.append(lead)
+
+        dropped = len(good_leads) - len(filtered)
+        if dropped:
+            progress(len(filtered), len(filtered),
+                     f"Polygon filter: dropped {dropped} results outside boundary")
+        good_leads = filtered
+
+    output = _format_leads(good_leads)
+    progress(len(output), len(output),
+             f"Done — {len(output)} leads from polygon area search")
     return output
