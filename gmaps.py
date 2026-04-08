@@ -110,6 +110,151 @@ const feed = document.querySelector('div[role="feed"]');
 if (feed) { feed.scrollTop = feed.scrollHeight; }
 """ + EXTRACT_LISTINGS_JS
 
+# Extract detail fields from a Maps listing page into a hidden div
+EXTRACT_DETAIL_JS = """
+(function() {
+  var d = {};
+
+  // Title
+  var h1 = document.querySelector('h1');
+  if (h1) d.title = h1.textContent.trim();
+
+  // Rating + review count from aria-labels
+  var ariaEls = document.querySelectorAll('[aria-label]');
+  for (var i = 0; i < ariaEls.length; i++) {
+    var lbl = ariaEls[i].getAttribute('aria-label') || '';
+    if (!d.rating) {
+      var starMatch = lbl.match(/([\d.]+)\s*star/i);
+      if (starMatch) d.rating = parseFloat(starMatch[1]);
+    }
+    if (!d.reviewCount) {
+      var revMatch = lbl.match(/([\d,]+)\s+review/i);
+      if (revMatch) d.reviewCount = parseInt(revMatch[1].replace(/,/g, ''), 10);
+    }
+  }
+  if (!d.reviewCount) {
+    var bodyText = document.body.innerText || '';
+    var revFb = bodyText.match(/\\(([\d,]+)\\)/);
+    if (revFb) d.reviewCount = parseInt(revFb[1].replace(/,/g, ''), 10);
+  }
+
+  // Category
+  var catBtn = document.querySelector('button[jsaction*="category"]');
+  if (catBtn) {
+    d.category = catBtn.textContent.trim();
+  } else {
+    var mainBtns = document.querySelectorAll('div[role="main"] button');
+    for (var i = 0; i < mainBtns.length; i++) {
+      var t = mainBtns[i].textContent.trim();
+      if (t && t.length < 40 && !/close|open|claim|share|save|send|direction|review|photo|call|menu/i.test(t) && !/^\\d/.test(t)) {
+        d.category = t;
+        break;
+      }
+    }
+  }
+
+  // Address
+  var addrEl = document.querySelector('button[data-item-id="address"]');
+  if (!addrEl) addrEl = document.querySelector('[data-tooltip="Copy address"]');
+  if (!addrEl) addrEl = document.querySelector('button[aria-label*="Address"]');
+  if (addrEl) {
+    var addrLabel = addrEl.getAttribute('aria-label') || '';
+    d.address = addrLabel.replace(/^Address:\\s*/i, '').trim() || addrEl.textContent.trim();
+  }
+
+  // Phone
+  var phoneEl = document.querySelector('button[data-item-id^="phone:"]');
+  if (!phoneEl) phoneEl = document.querySelector('[data-tooltip="Copy phone number"]');
+  if (phoneEl) {
+    var phoneLbl = phoneEl.getAttribute('aria-label') || '';
+    d.phone = phoneLbl.replace(/^Phone:\\s*/i, '').trim() || phoneEl.textContent.trim();
+  }
+
+  // Website
+  var webEl = document.querySelector('a[data-item-id="authority"]');
+  if (!webEl) webEl = document.querySelector('a[aria-label*="website" i]');
+  if (webEl) d.website = webEl.href;
+
+  // Hours from aria-labels containing day names
+  var days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+  var hoursArr = [];
+  for (var i = 0; i < ariaEls.length; i++) {
+    var lbl = ariaEls[i].getAttribute('aria-label') || '';
+    for (var j = 0; j < days.length; j++) {
+      if (lbl.indexOf(days[j]) !== -1 && lbl.length < 200) {
+        hoursArr.push(lbl.trim());
+        break;
+      }
+    }
+  }
+  if (hoursArr.length > 0) d.hours = hoursArr.join('; ');
+
+  // Price level
+  var mainEl = document.querySelector('div[role="main"]');
+  if (mainEl) {
+    var mainText = mainEl.innerText || '';
+    var priceMatch = mainText.match(/(?:^|\\s)(\\${1,4})(?:\\s|\\xB7|$)/m);
+    if (priceMatch) d.priceLevel = priceMatch[1];
+  }
+
+  // Review distribution
+  var dist = {};
+  for (var i = 0; i < ariaEls.length; i++) {
+    var lbl = ariaEls[i].getAttribute('aria-label') || '';
+    var distMatch = lbl.match(/(\\d)\\s*stars?,\\s*([\\d,]+)\\s*review/i);
+    if (distMatch) {
+      dist[distMatch[1]] = parseInt(distMatch[2].replace(/,/g, ''), 10);
+    }
+  }
+  if (Object.keys(dist).length === 0 && d.reviewCount) {
+    for (var i = 0; i < ariaEls.length; i++) {
+      var lbl = ariaEls[i].getAttribute('aria-label') || '';
+      var pctMatch = lbl.match(/(\\d)\\s*stars?,?\\s*(\\d+)%/i);
+      if (pctMatch) {
+        dist[pctMatch[1]] = Math.round(d.reviewCount * parseInt(pctMatch[2]) / 100);
+      }
+    }
+  }
+  if (Object.keys(dist).length > 0) d.reviewDistribution = dist;
+
+  // Coordinates from URL
+  var url = window.location.href;
+  var coordMatch = url.match(/!3d(-?\\d+\\.\\d+)!4d(-?\\d+\\.\\d+)/);
+  if (!coordMatch) coordMatch = url.match(/@(-?\\d+\\.\\d+),(-?\\d+\\.\\d+)/);
+  if (coordMatch) {
+    d.latitude = parseFloat(coordMatch[1]);
+    d.longitude = parseFloat(coordMatch[2]);
+  }
+
+  // Place ID from URL
+  var pidMatch = url.match(/!1s(ChIJ[^!&?]+)/);
+  if (pidMatch) d.placeId = decodeURIComponent(pidMatch[1]);
+
+  // Closed status
+  var bt = document.body.innerText || '';
+  d.permanentlyClosed = /permanently closed/i.test(bt);
+  d.temporarilyClosed = /temporarily closed/i.test(bt);
+
+  // Plus code
+  var plusMatch = bt.match(/[23456789CFGHJMPQRVWX]{4}\\+[23456789CFGHJMPQRVWX]{2,3}\\s+\\w+/i);
+  if (plusMatch) d.plusCode = plusMatch[0].trim();
+
+  // Description
+  var descEl = document.querySelector('div.PYvSYb');
+  if (descEl) d.description = descEl.textContent.trim();
+
+  // Write to hidden div
+  var el = document.getElementById('__gmaps_detail__');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = '__gmaps_detail__';
+    el.style.display = 'none';
+    document.body.appendChild(el);
+  }
+  el.textContent = JSON.stringify(d);
+})();
+"""
+
 
 # ── Parsing helpers ──────────────────────────────────────────────────
 
@@ -177,6 +322,79 @@ def _parse_listings_from_js_data(html: str) -> list[dict] | None:
         _add_listing(listings, seen_urls, href, name)
 
     return listings if listings else None
+
+
+def _parse_detail_from_js_data(html: str) -> dict | None:
+    """Extract detail data from the __gmaps_detail__ hidden div.
+
+    Returns a dict of detail fields if found, or None to signal fallback to regex.
+    """
+    marker = 'id="__gmaps_detail__"'
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+
+    start = html.find(">", idx + len(marker))
+    if start == -1:
+        return None
+    start += 1
+    end = html.find("</div>", start)
+    if end == -1:
+        return None
+
+    json_str = html[start:end].strip()
+    if not json_str:
+        return None
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        import html as html_mod
+        try:
+            data = json.loads(html_mod.unescape(json_str))
+        except (json.JSONDecodeError, Exception):
+            log.warning("Found __gmaps_detail__ div but could not parse JSON")
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    detail = {}
+    if data.get("title"):
+        detail["name"] = data["title"]
+    if data.get("rating") is not None:
+        detail["rating"] = data["rating"]
+    if data.get("reviewCount") is not None:
+        detail["review_count"] = data["reviewCount"]
+    if data.get("category"):
+        detail["category"] = data["category"]
+    if data.get("address"):
+        detail["address"] = data["address"]
+        _parse_address_components(data["address"], detail)
+    if data.get("phone"):
+        detail["phone"] = data["phone"]
+    if data.get("website"):
+        detail["website"] = data["website"]
+    if data.get("hours"):
+        detail["hours"] = data["hours"]
+    if data.get("priceLevel"):
+        detail["price_level"] = data["priceLevel"]
+    if data.get("reviewDistribution"):
+        detail["review_distribution"] = data["reviewDistribution"]
+    if data.get("latitude") is not None:
+        detail["latitude"] = data["latitude"]
+    if data.get("longitude") is not None:
+        detail["longitude"] = data["longitude"]
+    if data.get("placeId"):
+        detail["place_id"] = data["placeId"]
+    detail["is_permanently_closed"] = bool(data.get("permanentlyClosed", False))
+    detail["is_temporarily_closed"] = bool(data.get("temporarilyClosed", False))
+    if data.get("plusCode"):
+        detail["plus_code"] = data["plusCode"]
+    if data.get("description"):
+        detail["description"] = data["description"]
+
+    return detail if detail else None
 
 
 def _parse_listings_from_html(html: str) -> list[dict]:
@@ -280,6 +498,23 @@ def _add_listing(listings: list, seen_urls: set, path: str, name: str):
 
 def _parse_listing_detail(html: str, md: str, maps_url: str) -> dict:
     """Parse full details from an individual listing's Maps page."""
+    # Primary: try JS-injected data from hidden div
+    js_detail = _parse_detail_from_js_data(html)
+    if js_detail:
+        log.info(f"Parsed detail from JS extraction: {len(js_detail)} fields")
+        # Fill URL-derived fields that JS might have missed
+        if "latitude" not in js_detail:
+            coord_match = _COORD_RE.search(maps_url)
+            if coord_match:
+                js_detail["latitude"] = float(coord_match.group(1))
+                js_detail["longitude"] = float(coord_match.group(2))
+        if "place_id" not in js_detail:
+            pid_match = _PLACE_ID_RE.search(maps_url)
+            if pid_match:
+                js_detail["place_id"] = pid_match.group(0)
+        return js_detail
+
+    # Fallback: regex on HTML + markdown
     detail = {}
     # Combine HTML and markdown for searching
     text = html + "\n" + md
@@ -642,7 +877,7 @@ async def _scrape_detail_page(
         word_count_threshold=0,
         remove_overlay_elements=True,
         wait_until="domcontentloaded",
-        js_code=CONSENT_JS,
+        js_code=CONSENT_JS + "\n" + EXTRACT_DETAIL_JS,
         delay_before_return_html=2.0,
     )
 
