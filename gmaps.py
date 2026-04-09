@@ -1276,8 +1276,8 @@ async def scrape_google_maps_area(
         progress(0, total_cells, f"Warning: {total_cells} cells is very large — consider increasing grid spacing")
 
     # Phase 1: Parallel grid cell search with multiple browser workers
-    # Railway Hobby: 8GB RAM, 8 vCPUs — run 5 concurrent browsers (~1GB total)
-    NUM_WORKERS = min(5, total_cells)
+    # Railway Hobby: 8GB RAM, 8 vCPUs — 3 concurrent browsers for stability
+    NUM_WORKERS = min(3, total_cells)
     seen_place_ids: set[str] = set()
     seen_urls: set[str] = set()
     all_listings: list[dict] = []
@@ -1285,10 +1285,15 @@ async def scrape_google_maps_area(
 
     async def grid_worker(worker_id: int, points: list[dict]):
         """Process a subset of grid cells in its own browser instance."""
+        # Stagger startup so browsers don't all launch at once
+        if worker_id > 0:
+            await asyncio.sleep(worker_id * 3)
+
         worker_browser = _make_maps_browser_config(config)
         worker_rate_limiter = DomainRateLimiter(min_delay=2.0)
+        crawler = None
 
-        async with AsyncWebCrawler(config=worker_browser) as crawler:
+        try:
             for local_i, point in enumerate(points):
                 if len(all_listings) >= max_results:
                     break
@@ -1303,10 +1308,26 @@ async def scrape_google_maps_area(
                          f"[W{worker_id+1}] Cell {cells_done[0]}/{total_cells}: "
                          f"@ {point['lat']:.4f},{point['lng']:.4f}")
 
-                html = await _scroll_and_collect(
-                    crawler, search_url, max_results=120,
-                    rate_limiter=worker_rate_limiter,
-                )
+                # (Re)create browser if needed (first run or after crash)
+                if crawler is None:
+                    crawler = AsyncWebCrawler(config=worker_browser)
+                    await crawler.__aenter__()
+                    log.info(f"[W{worker_id+1}] Browser started")
+
+                try:
+                    html = await _scroll_and_collect(
+                        crawler, search_url, max_results=120,
+                        rate_limiter=worker_rate_limiter,
+                    )
+                except Exception as e:
+                    log.warning(f"[W{worker_id+1}] Browser error: {e}, restarting...")
+                    try:
+                        await crawler.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    crawler = None
+                    await asyncio.sleep(5)  # cooldown before restart
+                    continue  # skip this cell, move to next
 
                 if html:
                     cell_listings = _parse_listings_from_html(html)
@@ -1336,6 +1357,12 @@ async def scrape_google_maps_area(
                 # Delay between cells within this worker
                 if local_i < len(points) - 1:
                     await asyncio.sleep(random.uniform(2, 4))
+        finally:
+            if crawler:
+                try:
+                    await crawler.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
     # Interleave grid points across workers (round-robin)
     # so nearby cells go to different workers
