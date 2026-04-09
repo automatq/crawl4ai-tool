@@ -159,7 +159,7 @@ def _make_config(input_config: dict) -> ScrapeConfig:
         stealth=input_config.get("stealth", True),
         use_google_maps=input_config.get("google_maps", False),
         crawl_depth=1 if input_config.get("deep_crawl", False) else 0,
-        concurrency=int(input_config.get("concurrency", 3)),
+        concurrency=int(input_config.get("concurrency", 5)),
     )
 
 

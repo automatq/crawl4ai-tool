@@ -821,6 +821,11 @@ async def _scroll_and_collect(
     if len(listings) >= max_results:
         return html
 
+    # No results at all — skip scrolling (saves ~5-10s per empty cell)
+    if not listings:
+        _log("No results on this page, skipping scrolls")
+        return html
+
     # Step 2: Scroll to load more results
     prev_count = len(listings)
     stale_rounds = 0
@@ -1129,7 +1134,7 @@ async def _scrape_details_and_enrich(
 
     Shared between scrape_google_maps() and scrape_google_maps_area().
     """
-    sem = asyncio.Semaphore(config.concurrency)
+    sem = asyncio.Semaphore(max(config.concurrency, 5))
 
     async def scrape_one(i: int, listing: dict) -> dict:
         async with sem:
@@ -1270,71 +1275,90 @@ async def scrape_google_maps_area(
     if total_cells > 500:
         progress(0, total_cells, f"Warning: {total_cells} cells is very large — consider increasing grid spacing")
 
-    # Phase 1: Scroll each grid cell, collect all unique listings
+    # Phase 1: Parallel grid cell search with multiple browser workers
+    # Railway Hobby: 8GB RAM, 8 vCPUs — run 5 concurrent browsers (~1GB total)
+    NUM_WORKERS = min(5, total_cells)
     seen_place_ids: set[str] = set()
     seen_urls: set[str] = set()
     all_listings: list[dict] = []
+    cells_done = [0]  # mutable counter for progress across workers
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        for cell_i, point in enumerate(grid_points):
-            if len(all_listings) >= max_results:
-                progress(cell_i, total_cells,
-                         f"Reached {max_results} max results, stopping grid search")
-                break
+    async def grid_worker(worker_id: int, points: list[dict]):
+        """Process a subset of grid cells in its own browser instance."""
+        worker_browser = _make_maps_browser_config(config)
+        worker_rate_limiter = DomainRateLimiter(min_delay=2.0)
 
-            search_url = (
-                f"https://www.google.com/maps/search/"
-                f"{quote_plus(keyword)}/@{point['lat']},{point['lng']},15z"
-            )
+        async with AsyncWebCrawler(config=worker_browser) as crawler:
+            for local_i, point in enumerate(points):
+                if len(all_listings) >= max_results:
+                    break
 
-            progress(cell_i, total_cells,
-                     f"Cell {cell_i+1}/{total_cells}: searching @ {point['lat']:.4f},{point['lng']:.4f}")
+                search_url = (
+                    f"https://www.google.com/maps/search/"
+                    f"{quote_plus(keyword)}/@{point['lat']},{point['lng']},15z"
+                )
 
-            # Reuse scroll_and_collect with reduced scrolling for smaller areas
-            html = await _scroll_and_collect(
-                crawler, search_url, max_results=120, rate_limiter=rate_limiter,
-            )
+                cells_done[0] += 1
+                progress(cells_done[0], total_cells,
+                         f"[W{worker_id+1}] Cell {cells_done[0]}/{total_cells}: "
+                         f"@ {point['lat']:.4f},{point['lng']:.4f}")
 
-            if html:
-                cell_listings = _parse_listings_from_html(html)
-                new_count = 0
-                for listing in cell_listings:
-                    # Deduplicate by place_id (primary) or URL (fallback)
-                    pid = listing.get("place_id", "")
-                    url_key = listing["maps_url"].split("?")[0].split("!")[0]
+                html = await _scroll_and_collect(
+                    crawler, search_url, max_results=120,
+                    rate_limiter=worker_rate_limiter,
+                )
 
-                    if pid and pid in seen_place_ids:
-                        continue
-                    if url_key in seen_urls:
-                        continue
+                if html:
+                    cell_listings = _parse_listings_from_html(html)
+                    new_count = 0
+                    for listing in cell_listings:
+                        pid = listing.get("place_id", "")
+                        url_key = listing["maps_url"].split("?")[0].split("!")[0]
 
-                    if pid:
-                        seen_place_ids.add(pid)
-                    seen_urls.add(url_key)
-                    all_listings.append(listing)
-                    new_count += 1
+                        if pid and pid in seen_place_ids:
+                            continue
+                        if url_key in seen_urls:
+                            continue
 
-                    if len(all_listings) >= max_results:
-                        break
+                        if pid:
+                            seen_place_ids.add(pid)
+                        seen_urls.add(url_key)
+                        all_listings.append(listing)
+                        new_count += 1
 
-                progress(cell_i + 1, total_cells,
-                         f"Cell {cell_i+1}/{total_cells}: +{new_count} new ({len(all_listings)} unique total)")
+                        if len(all_listings) >= max_results:
+                            break
 
-            # Random delay between cells
-            if cell_i < total_cells - 1:
-                delay = random.uniform(3, 8)
-                await asyncio.sleep(delay)
+                    if new_count:
+                        progress(cells_done[0], total_cells,
+                                 f"[W{worker_id+1}] +{new_count} new ({len(all_listings)} unique total)")
 
-        progress(total_cells, total_cells,
-                 f"Grid search complete: {len(all_listings)} unique listings from {total_cells} cells")
+                # Delay between cells within this worker
+                if local_i < len(points) - 1:
+                    await asyncio.sleep(random.uniform(2, 4))
 
-        if not all_listings:
-            progress(0, 0, "No listings found in polygon area")
-            return []
+    # Interleave grid points across workers (round-robin)
+    # so nearby cells go to different workers
+    worker_chunks = [grid_points[i::NUM_WORKERS] for i in range(NUM_WORKERS)]
 
-        # Phase 2: Scrape detail pages + enrichment
+    progress(0, total_cells,
+             f"Starting {NUM_WORKERS} parallel workers across {total_cells} cells")
+
+    await asyncio.gather(*[
+        grid_worker(i, chunk) for i, chunk in enumerate(worker_chunks)
+    ])
+
+    progress(total_cells, total_cells,
+             f"Grid search complete: {len(all_listings)} unique listings from {total_cells} cells")
+
+    if not all_listings:
+        progress(0, 0, "No listings found in polygon area")
+        return []
+
+    # Phase 2: Scrape detail pages + enrichment (with own browser)
+    async with AsyncWebCrawler(config=browser_config) as detail_crawler:
         good_leads = await _scrape_details_and_enrich(
-            crawler, all_listings, max_results, enrich_websites,
+            detail_crawler, all_listings, max_results, enrich_websites,
             config, rate_limiter, progress,
         )
 
