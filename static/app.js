@@ -87,23 +87,99 @@ function handleFile(file) {
   reader.readAsText(file);
 }
 
-// ── Area search toggle ───────────────────────────────────────────────
+// ── City selector ────────────────────────────────────────────────────
 
-$("#maps-area-search").addEventListener("change", () => {
-  const on = $("#maps-area-search").checked;
-  $("#maps-area-fields").hidden = !on;
-  // Hide city field — polygon coordinates replace it
-  $("#maps-city-field").hidden = on;
-  // Lift max results cap when area search is on
-  const maxInput = $("#maps-max");
-  if (on) {
-    maxInput.max = 2000;
-    if (parseInt(maxInput.value) <= 120) maxInput.value = 500;
-  } else {
-    maxInput.max = 120;
-    if (parseInt(maxInput.value) > 120) maxInput.value = 100;
+let allCities = [];
+let filteredCities = [];
+let selectedCityIds = new Set();
+
+async function loadProvinces() {
+  try {
+    const resp = await fetch("/api/provinces");
+    const data = await resp.json();
+    const sel = document.getElementById("filter-province");
+    data.provinces.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    console.error("Failed to load provinces:", e);
   }
+}
+
+async function loadCities() {
+  const province = document.getElementById("filter-province").value;
+  const minPop = document.getElementById("filter-population").value;
+  const params = new URLSearchParams();
+  if (province) params.set("province", province);
+  if (minPop && minPop !== "0") params.set("min_population", minPop);
+
+  try {
+    const resp = await fetch("/api/cities?" + params);
+    const data = await resp.json();
+    filteredCities = data.cities;
+    renderCityList();
+  } catch (e) {
+    console.error("Failed to load cities:", e);
+  }
+}
+
+function renderCityList() {
+  const container = document.getElementById("city-list");
+  if (!filteredCities.length) {
+    container.innerHTML =
+      '<div class="city-list-empty">No cities match filters</div>';
+    updateCityCount();
+    return;
+  }
+  container.innerHTML = filteredCities
+    .map(
+      (c) => `
+    <label class="city-item">
+      <input type="checkbox" value="${c.id}" ${selectedCityIds.has(c.id) ? "checked" : ""}
+             onchange="toggleCity(${c.id}, this.checked)">
+      <span class="city-name">${esc(c.city)}</span>
+      <span class="city-province">${esc(c.province_id)}</span>
+      <span class="city-pop">${(c.population || 0).toLocaleString()}</span>
+    </label>`
+    )
+    .join("");
+  updateCityCount();
+}
+
+function toggleCity(id, checked) {
+  if (checked) selectedCityIds.add(id);
+  else selectedCityIds.delete(id);
+  updateCityCount();
+}
+
+function updateCityCount() {
+  document.getElementById("city-count").textContent =
+    `${selectedCityIds.size} cities selected`;
+}
+
+document.getElementById("select-all-cities").addEventListener("click", () => {
+  filteredCities.forEach((c) => selectedCityIds.add(c.id));
+  renderCityList();
 });
+
+document.getElementById("deselect-all-cities").addEventListener("click", () => {
+  selectedCityIds.clear();
+  renderCityList();
+});
+
+document
+  .getElementById("filter-province")
+  .addEventListener("change", loadCities);
+document
+  .getElementById("filter-population")
+  .addEventListener("change", loadCities);
+
+// Load on page init
+loadProvinces();
+loadCities();
 
 // ── Outreach toggle ──────────────────────────────────────────────────
 
@@ -142,40 +218,49 @@ $("#start-btn").addEventListener("click", async () => {
     payload = { keyword, cities, num, ...advancedOpts };
   } else if (currentMode === "maps") {
     const keyword = $("#maps-keyword").value.trim();
-    const city = $("#maps-city").value.trim();
-    const maxResults = parseInt($("#maps-max").value) || 100;
+    const maxResults = parseInt($("#maps-max").value) || 500;
     const enrich = $("#maps-enrich").checked;
-    const areaSearch = $("#maps-area-search").checked;
+    const gridSpacing = parseFloat($("#maps-grid-spacing")?.value) || 1.0;
     if (!keyword) {
       showToast("Enter a business type to search for", "warn");
       return;
     }
-    if (!areaSearch && !city) {
-      showToast("Enter a location or enable area search with a polygon", "warn");
-      return;
-    }
-    let polygonData = null;
-    if (areaSearch) {
-      const raw = $("#maps-polygon").value.trim();
-      if (!raw) {
-        showToast("Paste a GeoJSON polygon for area search", "warn");
-        return;
-      }
+
+    // Check for custom polygon first (advanced fallback)
+    const rawPolygon = $("#maps-polygon")?.value?.trim();
+    if (rawPolygon) {
+      let polygonData;
       try {
-        polygonData = JSON.parse(raw);
+        polygonData = JSON.parse(rawPolygon);
       } catch {
         showToast("Invalid GeoJSON — check your polygon JSON", "error");
         return;
       }
+      endpoint = "/api/maps";
+      payload = {
+        keyword,
+        max_results: maxResults,
+        enrich_websites: enrich,
+        area_search: true,
+        polygon: polygonData,
+        grid_spacing_km: gridSpacing,
+        ...advancedOpts,
+      };
+    } else if (selectedCityIds.size > 0) {
+      // Multi-city mode
+      endpoint = "/api/maps";
+      payload = {
+        keyword,
+        city_ids: [...selectedCityIds],
+        max_results: maxResults,
+        enrich_websites: enrich,
+        grid_spacing_km: gridSpacing,
+        ...advancedOpts,
+      };
+    } else {
+      showToast("Select at least one city or paste a custom polygon", "warn");
+      return;
     }
-    endpoint = "/api/maps";
-    payload = {
-      keyword, city, max_results: maxResults, enrich_websites: enrich,
-      area_search: areaSearch,
-      polygon: polygonData,
-      grid_spacing_km: parseFloat($("#maps-grid-spacing")?.value) || 1.0,
-      ...advancedOpts,
-    };
   } else if (currentMode === "import") {
     if (!importedData || !importedData.length) {
       showToast("Upload a JSON file first", "warn");

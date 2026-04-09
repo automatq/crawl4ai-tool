@@ -386,6 +386,103 @@ textarea:focus {
   font-weight: 500;
 }
 
+/* ── City selector ──────────────────────────────────────────────────── */
+
+.city-selector {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-card);
+}
+
+.city-filters {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  background: var(--bg-body);
+  border-bottom: 1px solid var(--border);
+}
+
+.city-filters select {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: var(--font);
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+
+.city-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.city-list {
+  max-height: 250px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.city-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.city-item:hover {
+  background: var(--bg-body);
+}
+
+.city-item input[type="checkbox"] {
+  flex-shrink: 0;
+}
+
+.city-name {
+  flex: 1;
+  font-weight: 500;
+}
+
+.city-province {
+  color: var(--text-secondary);
+  font-size: 12px;
+  width: 30px;
+  text-align: center;
+}
+
+.city-pop {
+  color: var(--text-muted);
+  font-size: 12px;
+  width: 70px;
+  text-align: right;
+}
+
+.city-list-empty {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.advanced-polygon {
+  margin-top: 8px;
+}
+
+.advanced-polygon summary {
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 /* ── RUN TAB ──────────────────────────────────────────────────────── */
 
 .run-info-bar {

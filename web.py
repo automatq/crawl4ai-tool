@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,18 @@ from outreach import run_outreach
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
+
+
+# ── Canadian cities database ──────────────────────────────────────────
+
+CITIES_DB = Path(__file__).parent / "canada_cities.db"
+
+
+def _get_cities_db():
+    """Return a sqlite3 connection to the cities database."""
+    conn = sqlite3.connect(str(CITIES_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 # ── Persistent backup to Railway volume ──────────────────────────────
@@ -511,6 +524,115 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
         job.log(f"Error: {e}", "error")
 
 
+def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
+                              max_per_city: int, grid_spacing_km: float, enrich: bool):
+    """Run polygon area search across multiple cities from the database."""
+    try:
+        cfg = _make_config(job.input_config)
+
+        # Fetch city metadata + polygons from DB
+        conn = _get_cities_db()
+        placeholders = ",".join("?" * len(city_ids))
+        cities = conn.execute(
+            f"SELECT id, city, province_name, polygon_geojson FROM cities "
+            f"WHERE id IN ({placeholders}) AND polygon_geojson IS NOT NULL",
+            city_ids,
+        ).fetchall()
+        conn.close()
+
+        if not cities:
+            raise ValueError("No valid cities found for the given IDs")
+
+        total_cities = len(cities)
+        all_leads = []
+        seen_place_ids = set()
+
+        with job.lock:
+            job.status = "searching"
+            job.progress_msg = f"Searching {total_cities} cities for '{keyword}'..."
+        job.log(f"Starting multi-city search: '{keyword}' across {total_cities} cities")
+        if cfg.stealth:
+            job.log("Stealth mode: enabled")
+        if enrich:
+            job.log("Website enrichment: enabled")
+
+        for city_i, city_row in enumerate(cities):
+            if job.cancel_flag:
+                raise InterruptedError("Cancelled")
+
+            city_name = city_row["city"]
+            province = city_row["province_name"]
+            polygon = json.loads(city_row["polygon_geojson"])
+            base_pct = int((city_i / total_cities) * 90)
+
+            with job.lock:
+                job.progress_pct = base_pct
+                job.progress_msg = f"Searching {city_name}, {province} ({city_i + 1}/{total_cities})..."
+            job.log(f"City {city_i + 1}/{total_cities}: {city_name}, {province}")
+
+            def maps_progress(current, total, msg, _cn=city_name, _bp=base_pct):
+                if job.cancel_flag:
+                    raise InterruptedError("Cancelled")
+                city_pct = int((current / max(total, 1)) * (90 / total_cities))
+                with job.lock:
+                    job.progress_pct = min(90, _bp + city_pct)
+                    job.progress_msg = f"[{_cn}] {msg}"
+                job.log(f"[{_cn}] {msg}")
+
+            city_leads = asyncio.run(scrape_google_maps_area(
+                keyword=keyword,
+                polygon=polygon,
+                grid_spacing_km=grid_spacing_km,
+                max_results=max_per_city,
+                enrich_websites=enrich,
+                config=cfg,
+                on_progress=maps_progress,
+            ))
+
+            # Deduplicate across cities by place_id
+            for lead in city_leads:
+                pid = lead.get("place_id", "")
+                if pid and pid in seen_place_ids:
+                    continue
+                if pid:
+                    seen_place_ids.add(pid)
+                lead["source_city"] = f"{city_name}, {province}"
+                all_leads.append(lead)
+
+            job.log(f"Found {len(city_leads)} leads in {city_name} "
+                    f"({len(all_leads)} total unique)")
+
+        with job.lock:
+            job.status = "done"
+            job.progress_pct = 100
+            job.results = all_leads
+            job.progress_msg = f"Done — {len(all_leads)} leads across {total_cities} cities."
+            job.finished_at = time.time()
+
+        # Outreach phase (if enabled)
+        all_leads = _run_outreach_phase(job, all_leads, cfg)
+        with job.lock:
+            job.results = all_leads
+            job.finished_at = time.time()
+
+        job.log(f"Completed: {len(all_leads)} leads in {job.duration:.1f}s")
+        _save_backup(job)
+
+    except InterruptedError:
+        with job.lock:
+            job.status = "cancelled"
+            job.progress_msg = "Cancelled by user."
+            job.finished_at = time.time()
+        job.log("Cancelled by user", "warn")
+    except Exception as e:
+        with job.lock:
+            job.status = "error"
+            job.error = str(e)
+            job.progress_msg = f"Error: {e}"
+            job.finished_at = time.time()
+        job.log(f"Error: {e}", "error")
+
+
 def _run_url_job(job: Job, urls: list[str]):
     try:
         cfg = _make_config(job.input_config)
@@ -580,6 +702,44 @@ def health():
     )
 
 
+@app.get("/api/provinces")
+def api_provinces():
+    """Return list of provinces that have cities with polygons."""
+    conn = _get_cities_db()
+    rows = conn.execute(
+        "SELECT DISTINCT province_name FROM cities "
+        "WHERE status='success' AND polygon_geojson IS NOT NULL "
+        "ORDER BY province_name"
+    ).fetchall()
+    conn.close()
+    return jsonify(provinces=[r["province_name"] for r in rows])
+
+
+@app.get("/api/cities")
+def api_cities():
+    """Return filterable city list (without polygon data)."""
+    province = request.args.get("province", "").strip()
+    min_pop = int(request.args.get("min_population", 0))
+
+    conn = _get_cities_db()
+    query = (
+        "SELECT id, city, province_id, province_name, population "
+        "FROM cities WHERE status='success' AND polygon_geojson IS NOT NULL"
+    )
+    params = []
+    if province:
+        query += " AND province_name = ?"
+        params.append(province)
+    if min_pop > 0:
+        query += " AND population >= ?"
+        params.append(min_pop)
+    query += " ORDER BY population DESC"
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return jsonify(cities=[dict(r) for r in rows])
+
+
 @app.post("/api/search")
 def api_search():
     data = request.get_json(force=True)
@@ -610,24 +770,45 @@ def api_search():
 def api_maps():
     data = request.get_json(force=True)
     keyword = data.get("keyword", "").strip()
+    if not keyword:
+        return jsonify(error="Keyword is required"), 400
+
+    city_ids = data.get("city_ids", [])
+    enrich = data.get("enrich_websites", False)
+    grid_spacing_km = float(data.get("grid_spacing_km", 1.0))
+    outreach_keys = ("outreach_enabled", "sender_email", "sender_phone",
+                     "sender_company", "message_template")
+
+    # ── Multi-city mode (city_ids from database) ──
+    if city_ids:
+        max_results = min(int(data.get("max_results", 500)), 2000)
+        job = _create_job(
+            mode="maps_multi_city", keyword=keyword, city_ids=city_ids,
+            max_results=max_results, enrich_websites=enrich,
+            grid_spacing_km=grid_spacing_km,
+            stealth=data.get("stealth", True),
+            proxies=data.get("proxies", ""),
+            concurrency=int(data.get("concurrency", 2)),
+            **{k: data[k] for k in outreach_keys if k in data},
+        )
+        _work_queue.put((_run_multi_city_maps_job,
+                         (job, keyword, city_ids, max_results, grid_spacing_km, enrich)))
+        return jsonify(job_id=job.id)
+
+    # ── Single polygon or city text mode (legacy) ──
     city = data.get("city", "").strip()
     query = data.get("query", "").strip()
     area_search = data.get("area_search", False)
     polygon = data.get("polygon")
 
-    # Area search allows up to 2000; normal search capped at 120
     max_cap = 2000 if (area_search and polygon) else 120
     max_results = min(int(data.get("max_results", 100)), max_cap)
-
-    enrich = data.get("enrich_websites", False)
 
     if not query:
         if keyword and city:
             query = f"{keyword} in {city}"
         elif keyword:
             query = keyword
-        else:
-            return jsonify(error="Keyword or query is required"), 400
 
     if area_search and not polygon:
         return jsonify(error="Polygon GeoJSON is required for area search"), 400
@@ -635,12 +816,11 @@ def api_maps():
     job = _create_job(
         mode="maps", query=query, keyword=keyword, max_results=max_results,
         enrich_websites=enrich, area_search=area_search, polygon=polygon,
-        grid_spacing_km=float(data.get("grid_spacing_km", 1.0)),
+        grid_spacing_km=grid_spacing_km,
         stealth=data.get("stealth", True),
         proxies=data.get("proxies", ""),
         concurrency=int(data.get("concurrency", 2)),
-        **{k: data[k] for k in ("outreach_enabled", "sender_email", "sender_phone",
-                                  "sender_company", "message_template") if k in data},
+        **{k: data[k] for k in outreach_keys if k in data},
     )
 
     _work_queue.put((_run_maps_job, (job, query, max_results, enrich)))
