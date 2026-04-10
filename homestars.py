@@ -124,7 +124,7 @@ def _make_hs_browser_config(config: ScrapeConfig) -> BrowserConfig:
     return BrowserConfig(**kwargs)
 
 
-# ── Phase 1: Google search for HomeStars URLs ─────────────────────────
+# ── Phase 1: Search engines for HomeStars URLs ──────────────────────
 
 _HS_COMPANY_URL_RE = re.compile(
     r'https?://(?:www\.)?homestars\.com/companies/([\w][\w-]*)',
@@ -132,7 +132,18 @@ _HS_COMPANY_URL_RE = re.compile(
 )
 
 
-async def _google_search_homestars(
+def _extract_hs_urls(html: str, seen: set) -> list[str]:
+    """Extract unique HomeStars company URLs from search result HTML."""
+    new_urls = []
+    for slug in _HS_COMPANY_URL_RE.findall(html):
+        hs_url = f"https://homestars.com/companies/{slug}"
+        if hs_url not in seen:
+            seen.add(hs_url)
+            new_urls.append(hs_url)
+    return new_urls
+
+
+async def _ddg_search_homestars(
     crawler: AsyncWebCrawler,
     keyword: str,
     city: str,
@@ -140,24 +151,80 @@ async def _google_search_homestars(
     max_results: int = 100,
     on_log: Callable | None = None,
 ) -> list[str]:
-    """Search Google for HomeStars company pages. Returns list of HS profile URLs."""
+    """Search DuckDuckGo for HomeStars company pages."""
+    found_urls = []
+    seen = set()
+
+    # DuckDuckGo doesn't have clean pagination — fetch first page with more results
+    query = f"site:homestars.com/companies {keyword} {city}"
+    url = f"https://duckduckgo.com/?q={quote_plus(query)}&t=h_&ia=web"
+    log.info(f"DuckDuckGo search URL: {url}")
+
+    if on_log:
+        on_log(f"DuckDuckGo search: '{keyword} {city}'...")
+
+    run_config = CrawlerRunConfig(
+        js_code="""
+            // Scroll down to trigger lazy-loading of more results
+            for (let i = 0; i < 5; i++) {
+                window.scrollTo(0, document.body.scrollHeight);
+                await new Promise(r => setTimeout(r, 1500));
+            }
+        """,
+        wait_for="css:body",
+        page_timeout=25000,
+    )
+
+    result, err = await _crawl_with_retry(
+        crawler, url, run_config,
+        max_retries=3, timeout=40,
+        rate_limiter=rate_limiter,
+    )
+
+    if err or not result.success:
+        log.warning(f"DuckDuckGo search failed: {err}")
+        if result and result.html:
+            _dump_debug("ddg_fail", result.html)
+        return []
+
+    html = result.html or ""
+    _dump_debug("ddg_results", html)
+    log.info(f"DuckDuckGo HTML length: {len(html)} chars")
+
+    new_urls = _extract_hs_urls(html, seen)
+    found_urls.extend(new_urls)
+    log.info(f"DuckDuckGo: {len(new_urls)} HomeStars URLs found")
+    if new_urls:
+        log.info(f"DuckDuckGo matches: {new_urls[:5]}")
+
+    return found_urls[:max_results]
+
+
+async def _bing_search_homestars(
+    crawler: AsyncWebCrawler,
+    keyword: str,
+    city: str,
+    rate_limiter: DomainRateLimiter,
+    max_results: int = 100,
+    on_log: Callable | None = None,
+) -> list[str]:
+    """Search Bing for HomeStars company pages."""
     found_urls = []
     seen = set()
     page = 0
-    max_pages = min(10, (max_results // 10) + 1)  # ~10 results per Google page
+    max_pages = min(10, (max_results // 10) + 1)
 
     while len(found_urls) < max_results and page < max_pages:
-        start = page * 10
+        first = page * 10 + 1
         query = f"site:homestars.com/companies {keyword} {city}"
-        url = f"https://www.google.com/search?q={quote_plus(query)}&start={start}&num=10"
-        log.info(f"Google search URL: {url}")
+        url = f"https://www.bing.com/search?q={quote_plus(query)}&first={first}"
+        log.info(f"Bing search URL: {url}")
 
         if on_log:
-            on_log(f"Google search page {page + 1}: '{keyword} {city}'...")
+            on_log(f"Bing search page {page + 1}: '{keyword} {city}'...")
 
         run_config = CrawlerRunConfig(
-            js_code=CONSENT_JS,
-            wait_for="css:body",
+            wait_for="css:#b_results",
             page_timeout=20000,
         )
 
@@ -168,39 +235,67 @@ async def _google_search_homestars(
         )
 
         if err or not result.success:
-            log.warning(f"Google search failed (page {page}): {err}")
-            # Dump debug on first failure
+            log.warning(f"Bing search failed (page {page}): {err}")
             if result and result.html:
-                _dump_debug(f"google_fail_p{page}", result.html)
+                _dump_debug(f"bing_fail_p{page}", result.html)
             break
 
         html = result.html or ""
+        _dump_debug(f"bing_p{page}", html)
+        log.info(f"Bing page {page} HTML length: {len(html)} chars")
 
-        # Always dump Google results for debugging
-        _dump_debug(f"google_p{page}", html)
-        log.info(f"Google page {page} HTML length: {len(html)} chars")
+        new_urls = _extract_hs_urls(html, seen)
+        found_urls.extend(new_urls)
+        log.info(f"Bing page {page + 1}: {len(new_urls)} new URLs ({len(found_urls)} total)")
+        if new_urls:
+            log.info(f"Bing matches: {new_urls[:5]}")
 
-        # Extract all homestars.com/companies/ URLs from the page
-        matches = _HS_COMPANY_URL_RE.findall(html)
-        log.info(f"Google page {page} regex matches: {matches[:10]}")
-        new_count = 0
-        for slug in matches:
-            hs_url = f"https://homestars.com/companies/{slug}"
-            if hs_url not in seen:
-                seen.add(hs_url)
-                found_urls.append(hs_url)
-                new_count += 1
-
-        log.info(f"Google page {page + 1}: {new_count} new HomeStars URLs ({len(found_urls)} total)")
-
-        if new_count == 0:
-            # No new results — Google has no more
+        if not new_urls:
             break
 
         page += 1
-        await asyncio.sleep(random.uniform(2.0, 4.0))
+        await asyncio.sleep(random.uniform(1.5, 3.0))
 
     return found_urls[:max_results]
+
+
+async def _search_homestars(
+    crawler: AsyncWebCrawler,
+    keyword: str,
+    city: str,
+    rate_limiter: DomainRateLimiter,
+    max_results: int = 100,
+    on_log: Callable | None = None,
+) -> list[str]:
+    """Search for HomeStars profiles using DuckDuckGo first, then Bing as fallback."""
+
+    # Try DuckDuckGo first — no CAPTCHAs
+    if on_log:
+        on_log(f"Searching DuckDuckGo for '{keyword}' in {city}...")
+    urls = await _ddg_search_homestars(
+        crawler, keyword, city, rate_limiter,
+        max_results=max_results, on_log=on_log,
+    )
+
+    if urls:
+        log.info(f"DuckDuckGo found {len(urls)} profiles — skipping Bing")
+        return urls
+
+    # Fallback to Bing
+    log.info("DuckDuckGo returned 0 results — trying Bing...")
+    if on_log:
+        on_log(f"Trying Bing for '{keyword}' in {city}...")
+    urls = await _bing_search_homestars(
+        crawler, keyword, city, rate_limiter,
+        max_results=max_results, on_log=on_log,
+    )
+
+    if urls:
+        log.info(f"Bing found {len(urls)} profiles")
+    else:
+        log.warning(f"Both DuckDuckGo and Bing returned 0 results for '{keyword}' in {city}")
+
+    return urls
 
 
 # ── Phase 2: Scrape HomeStars profile pages ───────────────────────────
@@ -556,7 +651,7 @@ async def scrape_homestars(
         on_progress: Callback(current, total, message)
     """
     config = config or ScrapeConfig()
-    google_limiter = DomainRateLimiter(min_delay=3.0)
+    search_limiter = DomainRateLimiter(min_delay=2.0)
     hs_limiter = DomainRateLimiter(min_delay=2.0)
     browser_config = _make_hs_browser_config(config)
 
@@ -566,12 +661,12 @@ async def scrape_homestars(
         if on_progress:
             on_progress(current, total, msg)
 
-    _progress(0, max_results, f"Searching Google for HomeStars '{keyword}' in {city}...")
+    _progress(0, max_results, f"Searching for HomeStars '{keyword}' in {city}...")
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        # Phase 1: Find HomeStars profile URLs via Google
-        profile_urls = await _google_search_homestars(
-            crawler, keyword, city, google_limiter,
+        # Phase 1: Find HomeStars profile URLs via DuckDuckGo / Bing
+        profile_urls = await _search_homestars(
+            crawler, keyword, city, search_limiter,
             max_results=max_results,
             on_log=lambda msg: _progress(0, max_results, msg),
         )
