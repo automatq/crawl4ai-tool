@@ -311,7 +311,7 @@ $("#start-btn").addEventListener("click", async () => {
     const enrich = $("#maps-enrich").checked;
     const gridSpacing = parseFloat($("#maps-grid-spacing")?.value) || 1.0;
     if (!keyword) {
-      showToast("Enter a business type to search for", "warn");
+      showToast("Enter a keyword to search for", "warn");
       return;
     }
 
@@ -355,7 +355,7 @@ $("#start-btn").addEventListener("click", async () => {
     const maxResults = parseInt($("#hs-max").value) || 100;
     const enrich = $("#hs-enrich").checked;
     if (!keyword) {
-      showToast("Enter a service category to search for", "warn");
+      showToast("Enter a keyword to search for", "warn");
       return;
     }
     if (hsSelectedCityIds.size === 0) {

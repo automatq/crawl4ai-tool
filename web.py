@@ -1024,7 +1024,7 @@ def api_homestars():
     data = request.get_json(force=True)
     keyword = data.get("keyword", "").strip()
     if not keyword:
-        return jsonify(error="Service category is required"), 400
+        return jsonify(error="Keyword is required"), 400
 
     city_ids = data.get("city_ids", [])
     if not city_ids:
