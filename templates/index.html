@@ -39,6 +39,7 @@
       <div class="input-mode-toggle">
         <button class="mode-btn active" data-mode="keyword">Keyword Search</button>
         <button class="mode-btn" data-mode="maps">Google Maps</button>
+        <button class="mode-btn" data-mode="homestars">HomeStars</button>
         <button class="mode-btn" data-mode="url">Direct URL</button>
         <button class="mode-btn" data-mode="import">Import File</button>
       </div>
@@ -124,6 +125,54 @@
             <textarea id="maps-polygon" rows="4" placeholder='Paste GeoJSON from geojson.io — use instead of city selection'></textarea>
           </div>
         </details>
+      </div>
+
+      <!-- HomeStars form -->
+      <div id="homestars-fields" class="form-section" hidden>
+        <div class="field">
+          <label for="hs-keyword">Service category</label>
+          <input type="text" id="hs-keyword" placeholder='e.g. "plumbing", "electrical", "roofing", "cleaning"'>
+          <small>The type of home service to search for on HomeStars</small>
+        </div>
+
+        <!-- City selector (shared with Maps mode) -->
+        <div class="field">
+          <label>Select cities</label>
+          <div class="city-selector">
+            <div class="city-filters">
+              <select id="hs-filter-province"><option value="">All provinces</option></select>
+              <select id="hs-filter-population">
+                <option value="0">All populations</option>
+                <option value="500000">500k+</option>
+                <option value="100000">100k+</option>
+                <option value="50000">50k+</option>
+                <option value="25000">25k+</option>
+                <option value="10000">10k+</option>
+              </select>
+            </div>
+            <div class="city-toolbar">
+              <button type="button" id="hs-select-all" class="btn btn-outline btn-sm">Select All</button>
+              <button type="button" id="hs-deselect-all" class="btn btn-outline btn-sm">Deselect All</button>
+              <span id="hs-city-count">0 cities selected</span>
+            </div>
+            <div id="hs-city-list" class="city-list">
+              <div class="city-list-empty">Loading cities...</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field field-sm">
+          <label for="hs-max">Max results per city</label>
+          <input type="number" id="hs-max" value="100" min="1" max="500">
+        </div>
+
+        <div class="option-row">
+          <label class="toggle-label">
+            <input type="checkbox" id="hs-enrich" checked>
+            <span>Enrich with website data</span>
+          </label>
+          <small>Visit each business website to extract emails and social links</small>
+        </div>
       </div>
 
       <!-- URL form -->

@@ -22,6 +22,7 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 from gmaps import scrape_google_maps, scrape_google_maps_area
+from homestars import scrape_homestars_multi_city, scrape_homestars
 from outreach import run_outreach
 
 app = Flask(__name__)
@@ -738,6 +739,88 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
         _log_run_finish(job)
 
 
+def _run_homestars_job(job: Job, keyword: str, city_ids: list[int],
+                        max_per_city: int, enrich: bool):
+    """Run HomeStars scraping across selected cities."""
+    _log_run_start(job)
+    try:
+        cfg = _make_config(job.input_config)
+
+        # Fetch city metadata from DB
+        conn = _get_cities_db()
+        placeholders = ",".join("?" * len(city_ids))
+        cities = conn.execute(
+            f"SELECT id, city, province_name FROM cities "
+            f"WHERE id IN ({placeholders})",
+            city_ids,
+        ).fetchall()
+        conn.close()
+
+        if not cities:
+            raise ValueError("No valid cities found for the given IDs")
+
+        city_list = [{"city": c["city"], "province_name": c["province_name"]} for c in cities]
+        total_cities = len(city_list)
+
+        with job.lock:
+            job.status = "searching"
+            job.progress_msg = f"Searching HomeStars in {total_cities} cities for '{keyword}'..."
+        job.log(f"Starting HomeStars search: '{keyword}' across {total_cities} cities")
+        if enrich:
+            job.log("Website enrichment: enabled")
+
+        def hs_progress(current, total, msg):
+            if job.cancel_flag:
+                raise InterruptedError("Cancelled")
+            with job.lock:
+                pct = int((current / max(total, 1)) * 90)
+                job.progress_pct = min(90, pct)
+                job.progress_msg = msg
+            job.log(msg)
+
+        leads = asyncio.run(scrape_homestars_multi_city(
+            keyword=keyword,
+            cities=city_list,
+            max_per_city=max_per_city,
+            enrich_websites=enrich,
+            config=cfg,
+            on_progress=hs_progress,
+        ))
+
+        with job.lock:
+            job.status = "done"
+            job.progress_pct = 100
+            job.results = leads
+            job.progress_msg = f"Done — {len(leads)} leads from HomeStars."
+            job.finished_at = time.time()
+
+        # Outreach phase (if enabled)
+        leads = _run_outreach_phase(job, leads, cfg)
+        with job.lock:
+            job.results = leads
+            job.finished_at = time.time()
+
+        job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
+        _save_backup(job)
+        _log_run_finish(job)
+
+    except InterruptedError:
+        with job.lock:
+            job.status = "cancelled"
+            job.progress_msg = "Cancelled by user."
+            job.finished_at = time.time()
+        job.log("Cancelled by user", "warn")
+        _log_run_finish(job)
+    except Exception as e:
+        with job.lock:
+            job.status = "error"
+            job.error = str(e)
+            job.progress_msg = f"Error: {e}"
+            job.finished_at = time.time()
+        job.log(f"Error: {e}", "error")
+        _log_run_finish(job)
+
+
 def _run_url_job(job: Job, urls: list[str]):
     _log_run_start(job)
     try:
@@ -936,6 +1019,35 @@ def api_maps():
     return jsonify(job_id=job.id)
 
 
+@app.post("/api/homestars")
+def api_homestars():
+    data = request.get_json(force=True)
+    keyword = data.get("keyword", "").strip()
+    if not keyword:
+        return jsonify(error="Service category is required"), 400
+
+    city_ids = data.get("city_ids", [])
+    if not city_ids:
+        return jsonify(error="Select at least one city"), 400
+
+    max_results = min(int(data.get("max_results", 100)), 500)
+    enrich = data.get("enrich_websites", False)
+    outreach_keys = ("outreach_enabled", "sender_email", "sender_phone",
+                     "sender_company", "message_template")
+
+    job = _create_job(
+        mode="homestars", keyword=keyword, city_ids=city_ids,
+        max_results=max_results, enrich_websites=enrich,
+        stealth=data.get("stealth", True),
+        proxies=data.get("proxies", ""),
+        concurrency=int(data.get("concurrency", 3)),
+        **{k: data[k] for k in outreach_keys if k in data},
+    )
+    _work_queue.put((_run_homestars_job,
+                     (job, keyword, city_ids, max_results, enrich)))
+    return jsonify(job_id=job.id)
+
+
 @app.post("/api/scrape")
 def api_scrape():
     data = request.get_json(force=True)
@@ -1056,8 +1168,9 @@ def _export_leads(leads, fmt="csv"):
         "address", "city", "state", "zip_code", "hours", "socials",
         "category", "rating", "neighborhood",
         "google_reviews", "google_rating", "review_distribution",
+        "homestars_rating", "homestars_reviews", "homestars_url", "homestars_verified",
         "price_level", "maps_url", "latitude", "longitude",
-        "place_id", "plus_code", "is_closed",
+        "place_id", "plus_code", "is_closed", "source_city",
     ])
     for lead in leads:
         if "error" in lead:
@@ -1081,6 +1194,10 @@ def _export_leads(leads, fmt="csv"):
             lead.get("google_reviews", ""),
             lead.get("google_rating", ""),
             json.dumps(lead.get("review_distribution", {})) if lead.get("review_distribution") else "",
+            lead.get("homestars_rating", ""),
+            lead.get("homestars_reviews", ""),
+            lead.get("homestars_url", ""),
+            "Yes" if lead.get("homestars_verified") else "",
             lead.get("price_level", ""),
             lead.get("maps_url", ""),
             lead.get("latitude", ""),
@@ -1088,6 +1205,7 @@ def _export_leads(leads, fmt="csv"):
             lead.get("place_id", ""),
             lead.get("plus_code", ""),
             "Yes" if is_closed else "",
+            lead.get("source_city", ""),
         ])
     return Response(
         output.getvalue(),

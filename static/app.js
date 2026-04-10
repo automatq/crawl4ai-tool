@@ -42,8 +42,11 @@ $$(".mode-btn").forEach((btn) => {
     currentMode = btn.dataset.mode;
     $("#keyword-fields").hidden = currentMode !== "keyword";
     $("#maps-fields").hidden = currentMode !== "maps";
+    $("#homestars-fields").hidden = currentMode !== "homestars";
     $("#url-fields").hidden = currentMode !== "url";
     $("#import-fields").hidden = currentMode !== "import";
+    // Load HomeStars city selector on first switch
+    if (currentMode === "homestars" && !hsProvincesLoaded) loadHsProvinces();
   });
 });
 
@@ -181,6 +184,92 @@ document
 loadProvinces();
 loadCities();
 
+// ── HomeStars city selector (separate state from Maps) ──────────────
+
+let hsAllCities = [];
+let hsFilteredCities = [];
+let hsSelectedCityIds = new Set();
+let hsProvincesLoaded = false;
+
+async function loadHsProvinces() {
+  if (hsProvincesLoaded) return;
+  try {
+    const resp = await fetch("/api/provinces");
+    const data = await resp.json();
+    const sel = document.getElementById("hs-filter-province");
+    data.provinces.forEach((p) => {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      sel.appendChild(opt);
+    });
+    hsProvincesLoaded = true;
+    loadHsCities();
+  } catch (e) {
+    console.error("Failed to load HS provinces:", e);
+  }
+}
+
+async function loadHsCities() {
+  const province = document.getElementById("hs-filter-province").value;
+  const minPop = document.getElementById("hs-filter-population").value;
+  const params = new URLSearchParams();
+  if (province) params.set("province", province);
+  if (minPop && minPop !== "0") params.set("min_population", minPop);
+
+  try {
+    const resp = await fetch("/api/cities?" + params);
+    const data = await resp.json();
+    hsFilteredCities = data.cities;
+    renderHsCityList();
+  } catch (e) {
+    console.error("Failed to load HS cities:", e);
+  }
+}
+
+function renderHsCityList() {
+  const container = document.getElementById("hs-city-list");
+  if (!hsFilteredCities.length) {
+    container.innerHTML = '<div class="city-list-empty">No cities match filters</div>';
+    updateHsCityCount();
+    return;
+  }
+  container.innerHTML = hsFilteredCities.map(c => `
+    <label class="city-item">
+      <input type="checkbox" value="${c.id}" ${hsSelectedCityIds.has(c.id) ? "checked" : ""}
+             onchange="toggleHsCity(${c.id}, this.checked)">
+      <span class="city-name">${esc(c.city)}</span>
+      <span class="city-province">${esc(c.province_id)}</span>
+      <span class="city-pop">${(c.population || 0).toLocaleString()}</span>
+    </label>`
+  ).join("");
+  updateHsCityCount();
+}
+
+function toggleHsCity(id, checked) {
+  if (checked) hsSelectedCityIds.add(id);
+  else hsSelectedCityIds.delete(id);
+  updateHsCityCount();
+}
+
+function updateHsCityCount() {
+  document.getElementById("hs-city-count").textContent =
+    `${hsSelectedCityIds.size} cities selected`;
+}
+
+document.getElementById("hs-select-all").addEventListener("click", () => {
+  hsFilteredCities.forEach(c => hsSelectedCityIds.add(c.id));
+  renderHsCityList();
+});
+
+document.getElementById("hs-deselect-all").addEventListener("click", () => {
+  hsSelectedCityIds.clear();
+  renderHsCityList();
+});
+
+document.getElementById("hs-filter-province").addEventListener("change", loadHsCities);
+document.getElementById("hs-filter-population").addEventListener("change", loadHsCities);
+
 // ── Outreach toggle ──────────────────────────────────────────────────
 
 $("#opt-outreach").addEventListener("change", () => {
@@ -261,6 +350,26 @@ $("#start-btn").addEventListener("click", async () => {
       showToast("Select at least one city or paste a custom polygon", "warn");
       return;
     }
+  } else if (currentMode === "homestars") {
+    const keyword = $("#hs-keyword").value.trim();
+    const maxResults = parseInt($("#hs-max").value) || 100;
+    const enrich = $("#hs-enrich").checked;
+    if (!keyword) {
+      showToast("Enter a service category to search for", "warn");
+      return;
+    }
+    if (hsSelectedCityIds.size === 0) {
+      showToast("Select at least one city", "warn");
+      return;
+    }
+    endpoint = "/api/homestars";
+    payload = {
+      keyword,
+      city_ids: [...hsSelectedCityIds],
+      max_results: maxResults,
+      enrich_websites: enrich,
+      ...advancedOpts,
+    };
   } else if (currentMode === "import") {
     if (!importedData || !importedData.length) {
       showToast("Upload a JSON file first", "warn");
@@ -420,7 +529,14 @@ function renderResults(data, targetBody = "#results-body") {
         .map(([p, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(p)}</a>`)
         .join(" ");
       const urlDisplay = lead.url ? `<a href="${esc(lead.url)}" target="_blank" rel="noopener">${esc(truncUrl(lead.url))}</a>` : "";
-      const mapsDisplay = lead.maps_url ? `<a href="${esc(lead.maps_url)}" target="_blank" rel="noopener">View</a>` : "";
+      // Show Maps or HomeStars link
+      const extUrl = lead.maps_url || lead.homestars_url || "";
+      const extLabel = lead.maps_url ? "Maps" : lead.homestars_url ? "HS" : "";
+      const extDisplay = extUrl ? `<a href="${esc(extUrl)}" target="_blank" rel="noopener">${extLabel}</a>` : "";
+      // Show whichever rating/reviews are available (Google or HomeStars)
+      const reviews = lead.google_reviews != null ? lead.google_reviews : lead.homestars_reviews;
+      const rating = lead.google_rating != null ? lead.google_rating
+        : lead.homestars_rating != null ? lead.homestars_rating + "/10" : null;
 
       tr.innerHTML = `
         <td class="cell-copy" title="Click to copy">${esc(lead.company || "")}</td>
@@ -430,12 +546,12 @@ function renderResults(data, targetBody = "#results-body") {
         <td class="cell-copy" title="Click to copy">${esc(phones)}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.address || "")}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.hours || "")}</td>
-        <td class="cell-copy" title="Click to copy">${lead.google_reviews != null ? esc(String(lead.google_reviews)) : ""}</td>
-        <td class="cell-copy" title="Click to copy">${lead.google_rating != null ? esc(String(lead.google_rating)) : ""}</td>
+        <td class="cell-copy" title="Click to copy">${reviews != null ? esc(String(reviews)) : ""}</td>
+        <td class="cell-copy" title="Click to copy">${rating != null ? esc(String(rating)) : ""}</td>
         <td class="cell-copy" title="Click to copy">${esc(lead.price_level || "")}</td>
         <td class="cell-socials">${socials}</td>
         <td class="cell-outreach" title="${esc(lead.outreach_detail || "")}">${outreachBadge(lead.outreach_status)}</td>
-        <td>${mapsDisplay}</td>
+        <td>${extDisplay}</td>
       `;
       tr.querySelectorAll(".cell-copy").forEach((td) => {
         td.addEventListener("click", () => {
