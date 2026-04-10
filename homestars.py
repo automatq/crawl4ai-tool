@@ -127,7 +127,7 @@ def _make_hs_browser_config(config: ScrapeConfig) -> BrowserConfig:
 # ── Phase 1: Google search for HomeStars URLs ─────────────────────────
 
 _HS_COMPANY_URL_RE = re.compile(
-    r'https?://(?:www\.)?homestars\.com/companies/(\d+[\w-]*)',
+    r'https?://(?:www\.)?homestars\.com/companies/([\w][\w-]*)',
     re.IGNORECASE,
 )
 
@@ -150,6 +150,7 @@ async def _google_search_homestars(
         start = page * 10
         query = f"site:homestars.com/companies {keyword} {city}"
         url = f"https://www.google.com/search?q={quote_plus(query)}&start={start}&num=10"
+        log.info(f"Google search URL: {url}")
 
         if on_log:
             on_log(f"Google search page {page + 1}: '{keyword} {city}'...")
@@ -175,12 +176,13 @@ async def _google_search_homestars(
 
         html = result.html or ""
 
-        # Dump first Google results page for debugging
-        if page == 0:
-            _dump_debug("google_results", html)
+        # Always dump Google results for debugging
+        _dump_debug(f"google_p{page}", html)
+        log.info(f"Google page {page} HTML length: {len(html)} chars")
 
         # Extract all homestars.com/companies/ URLs from the page
         matches = _HS_COMPANY_URL_RE.findall(html)
+        log.info(f"Google page {page} regex matches: {matches[:10]}")
         new_count = 0
         for slug in matches:
             hs_url = f"https://homestars.com/companies/{slug}"
@@ -558,6 +560,8 @@ async def scrape_homestars(
     hs_limiter = DomainRateLimiter(min_delay=2.0)
     browser_config = _make_hs_browser_config(config)
 
+    log.info(f"=== HomeStars scrape start: keyword='{keyword}', city='{city}', province='{province_name}', max={max_results} ===")
+
     def _progress(current, total, msg):
         if on_progress:
             on_progress(current, total, msg)
@@ -571,6 +575,8 @@ async def scrape_homestars(
             max_results=max_results,
             on_log=lambda msg: _progress(0, max_results, msg),
         )
+
+        log.info(f"Google search returned {len(profile_urls)} profile URLs: {profile_urls[:5]}")
 
         if not profile_urls:
             _progress(0, 1, f"No HomeStars results found for '{keyword}' in {city}")
