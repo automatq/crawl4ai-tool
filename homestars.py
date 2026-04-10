@@ -3,20 +3,23 @@
 HomeStars Scraper Module
 
 Scrapes business listings from HomeStars.com (Canadian home services platform).
+Uses Google search (site:homestars.com) to discover company profile URLs,
+then scrapes each profile page for detailed business data.
+
 Extracts: company name, rating (0-10), review count, phone, website,
 address, categories, verified status, years in business.
-
-Uses crawl4ai headless browser + __NEXT_DATA__ JSON extraction (Next.js site).
 """
 
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Callable
-from urllib.parse import quote
+from urllib.parse import quote_plus
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
@@ -34,27 +37,52 @@ from scrape import (
 log = logging.getLogger("homestars")
 logging.basicConfig(level=logging.INFO)
 
+# ── Debug dump directory ──────────────────────────────────────────────
 
-# ── Province name → HomeStars URL code mapping ───────────────────────
+DEBUG_DIR = Path(os.environ.get("DEBUG_DIR", "/data/debug"))
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-PROVINCE_CODES = {
-    "Alberta": "ab",
-    "British Columbia": "bc",
-    "Manitoba": "mb",
-    "New Brunswick": "nb",
-    "Newfoundland and Labrador": "nl",
-    "Northwest Territories": "nt",
-    "Nova Scotia": "ns",
-    "Nunavut": "nu",
-    "Ontario": "on",
-    "Prince Edward Island": "pe",
-    "Quebec": "qc",
-    "Saskatchewan": "sk",
-    "Yukon": "yt",
+
+def _dump_debug(name: str, content: str):
+    """Save debug content to a file."""
+    try:
+        path = DEBUG_DIR / f"hs_{name}_{int(time.time())}.html"
+        path.write_text(content[:500_000])  # Cap at 500KB
+        log.info(f"Debug dump saved: {path}")
+    except Exception as e:
+        log.warning(f"Debug dump failed: {e}")
+
+
+def _dump_json_debug(name: str, data):
+    """Save debug JSON to a file."""
+    try:
+        path = DEBUG_DIR / f"hs_{name}_{int(time.time())}.json"
+        path.write_text(json.dumps(data, indent=2, default=str)[:500_000])
+        log.info(f"Debug JSON dump saved: {path}")
+    except Exception as e:
+        log.warning(f"Debug JSON dump failed: {e}")
+
+
+# ── Google consent JS (reused from gmaps) ─────────────────────────────
+
+CONSENT_JS = """
+const btns = document.querySelectorAll('button');
+for (const btn of btns) {
+    const text = btn.textContent.trim().toLowerCase();
+    if (text === 'accept all' || text === 'i agree' || text === 'consent'
+        || text === 'accept' || text === 'ok' || text === 'got it') {
+        btn.click();
+        break;
+    }
 }
+const form = document.querySelector('form[action*="consent"]');
+if (form) {
+    const submit = form.querySelector('button, input[type="submit"]');
+    if (submit) submit.click();
+}
+"""
 
-
-# ── JS to extract __NEXT_DATA__ from the page ────────────────────────
+# ── JS to extract __NEXT_DATA__ from HomeStars pages ──────────────────
 
 EXTRACT_NEXT_DATA_JS = """
 (function() {
@@ -68,25 +96,11 @@ EXTRACT_NEXT_DATA_JS = """
 })();
 """
 
-DISMISS_COOKIE_JS = """
-(function() {
-    // Dismiss cookie consent banners
-    const btns = document.querySelectorAll('button');
-    for (const b of btns) {
-        const t = b.textContent.trim().toLowerCase();
-        if (t === 'accept' || t === 'accept all' || t === 'ok' || t === 'got it') {
-            b.click();
-            break;
-        }
-    }
-})();
-"""
-
 
 # ── Browser config ────────────────────────────────────────────────────
 
 def _make_hs_browser_config(config: ScrapeConfig) -> BrowserConfig:
-    """HomeStars needs full rendering (Next.js SPA)."""
+    """Browser config — needs full rendering for both Google and HomeStars."""
     from crawl4ai.async_configs import ProxyConfig
     from crawl4ai.proxy_strategy import RoundRobinProxyStrategy
 
@@ -110,28 +124,91 @@ def _make_hs_browser_config(config: ScrapeConfig) -> BrowserConfig:
     return BrowserConfig(**kwargs)
 
 
-# ── URL helpers ───────────────────────────────────────────────────────
+# ── Phase 1: Google search for HomeStars URLs ─────────────────────────
 
-def _build_search_url(keyword: str, city: str, province_code: str, page: int = 1) -> str:
-    """Build HomeStars search URL using legacy format with pagination."""
-    # Slugify city name: "St. Catharines" -> "st-catharines"
-    city_slug = re.sub(r'[^a-z0-9]+', '-', city.lower()).strip('-')
-    # Slugify keyword
-    kw_slug = re.sub(r'[^a-z0-9]+', '-', keyword.lower()).strip('-')
-    url = f"https://homestars.com/{province_code}/{city_slug}/{kw_slug}"
-    if page > 1:
-        url += f"?page={page}"
-    return url
+_HS_COMPANY_URL_RE = re.compile(
+    r'https?://(?:www\.)?homestars\.com/companies/(\d+[\w-]*)',
+    re.IGNORECASE,
+)
 
 
-# ── Parsing ───────────────────────────────────────────────────────────
+async def _google_search_homestars(
+    crawler: AsyncWebCrawler,
+    keyword: str,
+    city: str,
+    rate_limiter: DomainRateLimiter,
+    max_results: int = 100,
+    on_log: Callable | None = None,
+) -> list[str]:
+    """Search Google for HomeStars company pages. Returns list of HS profile URLs."""
+    found_urls = []
+    seen = set()
+    page = 0
+    max_pages = min(10, (max_results // 10) + 1)  # ~10 results per Google page
+
+    while len(found_urls) < max_results and page < max_pages:
+        start = page * 10
+        query = f"site:homestars.com/companies {keyword} {city}"
+        url = f"https://www.google.com/search?q={quote_plus(query)}&start={start}&num=10"
+
+        if on_log:
+            on_log(f"Google search page {page + 1}: '{keyword} {city}'...")
+
+        run_config = CrawlerRunConfig(
+            js_code=CONSENT_JS,
+            wait_for="css:body",
+            page_timeout=20000,
+        )
+
+        result, err = await _crawl_with_retry(
+            crawler, url, run_config,
+            max_retries=3, timeout=30,
+            rate_limiter=rate_limiter,
+        )
+
+        if err or not result.success:
+            log.warning(f"Google search failed (page {page}): {err}")
+            # Dump debug on first failure
+            if result and result.html:
+                _dump_debug(f"google_fail_p{page}", result.html)
+            break
+
+        html = result.html or ""
+
+        # Dump first Google results page for debugging
+        if page == 0:
+            _dump_debug("google_results", html)
+
+        # Extract all homestars.com/companies/ URLs from the page
+        matches = _HS_COMPANY_URL_RE.findall(html)
+        new_count = 0
+        for slug in matches:
+            hs_url = f"https://homestars.com/companies/{slug}"
+            if hs_url not in seen:
+                seen.add(hs_url)
+                found_urls.append(hs_url)
+                new_count += 1
+
+        log.info(f"Google page {page + 1}: {new_count} new HomeStars URLs ({len(found_urls)} total)")
+
+        if new_count == 0:
+            # No new results — Google has no more
+            break
+
+        page += 1
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+    return found_urls[:max_results]
+
+
+# ── Phase 2: Scrape HomeStars profile pages ───────────────────────────
 
 def _extract_next_data(html: str) -> dict | None:
-    """Extract __NEXT_DATA__ JSON from the page HTML."""
+    """Extract __NEXT_DATA__ JSON from HomeStars page HTML."""
     # Try the injected div first
     m = re.search(
         r'<div\s+id="__hs_next_data__"[^>]*>(.*?)</div>',
-        html, re.DOTALL
+        html, re.DOTALL,
     )
     if m:
         try:
@@ -142,7 +219,7 @@ def _extract_next_data(html: str) -> dict | None:
     # Fallback: parse directly from the script tag
     m = re.search(
         r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-        html, re.DOTALL
+        html, re.DOTALL,
     )
     if m:
         try:
@@ -153,135 +230,106 @@ def _extract_next_data(html: str) -> dict | None:
     return None
 
 
-def _parse_listings_from_next_data(data: dict) -> list[dict]:
-    """Extract listing URLs and basic info from search results __NEXT_DATA__."""
-    listings = []
-
-    # Navigate the Next.js data structure — try common paths
+def _parse_profile_from_next_data(data: dict, homestars_url: str) -> dict | None:
+    """Extract company data from a profile page's __NEXT_DATA__."""
     props = data.get("props", {}).get("pageProps", {})
 
-    # Try various keys where listings might be stored
-    for key in ("companies", "professionals", "results", "listings", "pros", "searchResults"):
-        items = props.get(key)
-        if items and isinstance(items, list):
-            for item in items:
-                listing = _normalize_listing(item)
-                if listing:
-                    listings.append(listing)
-            if listings:
-                return listings
+    # Try various keys where company data might live
+    company = None
+    for key in ("company", "professional", "profile", "companyData", "pro"):
+        if key in props and isinstance(props[key], dict):
+            company = props[key]
+            break
 
-    # Try nested structures
-    search_data = props.get("searchData") or props.get("data") or props.get("initialData") or {}
-    if isinstance(search_data, dict):
-        for key in ("companies", "professionals", "results", "listings", "pros"):
-            items = search_data.get(key)
-            if items and isinstance(items, list):
-                for item in items:
-                    listing = _normalize_listing(item)
-                    if listing:
-                        listings.append(listing)
-                if listings:
-                    return listings
+    # If no specific key, try pageProps itself if it has a name
+    if not company:
+        if any(k in props for k in ("name", "companyName", "title")):
+            company = props
 
-    # Deep scan: look for any array of objects with company-like fields
-    listings = _deep_scan_for_listings(props)
-    return listings
+    if not company or not isinstance(company, dict):
+        return None
+
+    return _normalize_company(company, homestars_url)
 
 
-def _deep_scan_for_listings(obj, depth=0) -> list[dict]:
-    """Recursively scan for arrays that look like company listings."""
-    if depth > 5:
-        return []
-
-    if isinstance(obj, list) and len(obj) > 0:
-        # Check if items look like company listings
-        if isinstance(obj[0], dict):
-            has_name = any(k in obj[0] for k in ("name", "companyName", "company_name", "title"))
-            has_id = any(k in obj[0] for k in ("id", "companyId", "company_id", "slug"))
-            if has_name and has_id:
-                results = []
-                for item in obj:
-                    listing = _normalize_listing(item)
-                    if listing:
-                        results.append(listing)
-                if results:
-                    return results
-
-    if isinstance(obj, dict):
-        for v in obj.values():
-            results = _deep_scan_for_listings(v, depth + 1)
-            if results:
-                return results
-
-    return []
-
-
-def _normalize_listing(item: dict) -> dict | None:
-    """Normalize a single listing from the Next.js data into our lead schema."""
+def _normalize_company(item: dict, homestars_url: str = "") -> dict | None:
+    """Normalize a company data dict into our lead schema."""
     if not isinstance(item, dict):
         return None
 
-    # Extract company name
-    name = (
-        item.get("name") or item.get("companyName") or item.get("company_name")
-        or item.get("title") or item.get("displayName") or ""
-    )
+    # Company name — try many possible keys
+    name = ""
+    for key in ("name", "companyName", "company_name", "title", "displayName", "businessName"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            name = val.strip()
+            break
     if not name:
         return None
 
-    # Extract ID and slug for building profile URL
-    company_id = item.get("id") or item.get("companyId") or item.get("company_id") or ""
-    slug = item.get("slug") or item.get("urlSlug") or item.get("url_slug") or ""
-
-    # Build profile URL
-    homestars_url = ""
-    if company_id:
-        if slug:
-            homestars_url = f"https://homestars.com/companies/{company_id}-{slug}"
-        else:
-            homestars_url = f"https://homestars.com/companies/{company_id}"
-    elif item.get("url") or item.get("profileUrl"):
-        homestars_url = item.get("url") or item.get("profileUrl")
-        if homestars_url and not homestars_url.startswith("http"):
-            homestars_url = f"https://homestars.com{homestars_url}"
-
     # Rating (HomeStars uses 0-10 scale)
-    rating = item.get("starScore") or item.get("star_score") or item.get("rating") or item.get("averageRating")
-    if rating is not None:
-        try:
-            rating = round(float(rating), 1)
-        except (ValueError, TypeError):
-            rating = None
+    rating = None
+    for key in ("starScore", "star_score", "rating", "averageRating", "score", "overallRating"):
+        val = item.get(key)
+        if val is not None:
+            try:
+                rating = round(float(val), 1)
+                break
+            except (ValueError, TypeError):
+                pass
 
     # Review count
-    reviews = item.get("reviewCount") or item.get("review_count") or item.get("numReviews") or item.get("reviewsCount")
-    if reviews is not None:
-        try:
-            reviews = int(reviews)
-        except (ValueError, TypeError):
-            reviews = None
+    reviews = None
+    for key in ("reviewCount", "review_count", "numReviews", "reviewsCount", "totalReviews"):
+        val = item.get(key)
+        if val is not None:
+            try:
+                reviews = int(val)
+                break
+            except (ValueError, TypeError):
+                pass
 
     # Phone
-    phone = item.get("phone") or item.get("phoneNumber") or item.get("phone_number") or ""
+    phone = ""
+    for key in ("phone", "phoneNumber", "phone_number", "contactPhone"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            phone = val.strip()
+            break
 
     # Website
-    website = item.get("website") or item.get("websiteUrl") or item.get("website_url") or ""
+    website = ""
+    for key in ("website", "websiteUrl", "website_url", "websiteLink"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            website = val.strip()
+            break
     if website and not website.startswith("http"):
         website = "https://" + website
 
     # Address
     address_parts = []
     for key in ("address", "streetAddress", "street_address", "street"):
-        if item.get(key):
-            address_parts.append(str(item[key]))
+        val = item.get(key)
+        if val and isinstance(val, str):
+            address_parts.append(val)
             break
-    city = item.get("city") or item.get("cityName") or ""
-    province = item.get("province") or item.get("provinceName") or item.get("state") or ""
+    city = ""
+    for key in ("city", "cityName", "city_name"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            city = val
+            break
+    province = ""
+    for key in ("province", "provinceName", "state"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            province = val
+            break
     if city:
-        address_parts.append(str(city))
+        address_parts.append(city)
     if province:
-        address_parts.append(str(province))
+        address_parts.append(province)
     address = ", ".join(address_parts)
 
     # Category
@@ -292,18 +340,42 @@ def _normalize_listing(item: dict) -> dict | None:
             category = cats[0].get("name") or cats[0].get("title") or ""
         elif isinstance(cats[0], str):
             category = cats[0]
-    elif isinstance(cats, str):
-        category = cats
     if not category:
-        category = item.get("category") or item.get("primaryCategory") or item.get("trade") or ""
+        for key in ("category", "primaryCategory", "trade", "profession"):
+            val = item.get(key)
+            if val and isinstance(val, str):
+                category = val
+                break
 
     # Verified status
-    verified = item.get("verified") or item.get("isVerified") or item.get("is_verified") or False
-    if isinstance(verified, dict):
-        verified = any(verified.values())
+    verified = False
+    for key in ("verified", "isVerified", "is_verified"):
+        val = item.get(key)
+        if val:
+            if isinstance(val, dict):
+                verified = any(val.values())
+            else:
+                verified = bool(val)
+            break
 
     # Years in business
-    years = item.get("yearsInBusiness") or item.get("years_in_business") or item.get("experience") or None
+    years = None
+    for key in ("yearsInBusiness", "years_in_business", "experience"):
+        val = item.get(key)
+        if val is not None:
+            try:
+                years = int(val)
+                break
+            except (ValueError, TypeError):
+                pass
+
+    # Description
+    desc = ""
+    for key in ("description", "about", "bio", "companyDescription"):
+        val = item.get(key)
+        if val and isinstance(val, str):
+            desc = val.strip()
+            break
 
     return {
         "company": name,
@@ -318,140 +390,56 @@ def _normalize_listing(item: dict) -> dict | None:
         "homestars_rating": rating,
         "homestars_reviews": reviews,
         "homestars_url": homestars_url,
-        "homestars_verified": bool(verified),
+        "homestars_verified": verified,
         "homestars_years": years,
         "socials": {},
         "price_level": "",
-        "description": item.get("description") or item.get("about") or "",
+        "description": desc,
     }
 
 
-def _parse_detail_from_next_data(data: dict) -> dict:
-    """Extract detailed company info from a profile page's __NEXT_DATA__."""
-    props = data.get("props", {}).get("pageProps", {})
-
-    # The company data might be under various keys
-    company = (
-        props.get("company") or props.get("professional") or props.get("profile")
-        or props.get("companyData") or props
-    )
-
-    if not isinstance(company, dict):
-        return {}
-
-    result = _normalize_listing(company)
-    if not result:
-        return {}
-
-    # Override with more detailed fields from the profile page
-    # Description might be longer on detail page
-    desc = company.get("description") or company.get("about") or company.get("bio") or ""
-    if desc:
-        result["description"] = desc
-
-    # Service areas
-    areas = company.get("serviceAreas") or company.get("service_areas") or []
-    if areas and isinstance(areas, list):
-        if isinstance(areas[0], dict):
-            result["service_areas"] = [a.get("name", "") for a in areas]
-        elif isinstance(areas[0], str):
-            result["service_areas"] = areas
-
-    # All categories/services
-    all_cats = company.get("categories") or company.get("services") or company.get("trades") or []
-    if all_cats and isinstance(all_cats, list):
-        if isinstance(all_cats[0], dict):
-            result["all_categories"] = [c.get("name") or c.get("title") or "" for c in all_cats]
-        elif isinstance(all_cats[0], str):
-            result["all_categories"] = all_cats
-
-    return result
-
-
-def _extract_total_results(data: dict) -> int | None:
-    """Try to extract total result count from search __NEXT_DATA__."""
-    props = data.get("props", {}).get("pageProps", {})
-
-    for key in ("totalCount", "total", "totalResults", "count", "resultCount"):
-        val = props.get(key)
-        if val is not None:
-            try:
-                return int(val)
-            except (ValueError, TypeError):
-                pass
-
-    # Check nested
-    for container_key in ("searchData", "data", "pagination", "meta"):
-        container = props.get(container_key, {})
-        if isinstance(container, dict):
-            for key in ("totalCount", "total", "totalResults", "count"):
-                val = container.get(key)
-                if val is not None:
-                    try:
-                        return int(val)
-                    except (ValueError, TypeError):
-                        pass
-    return None
-
-
-# ── Fallback HTML parsing (if __NEXT_DATA__ doesn't work) ────────────
-
-def _parse_listings_from_html(html: str) -> list[dict]:
-    """Fallback: extract listings from rendered HTML using regex."""
-    listings = []
-
-    # Find company profile links
-    urls = re.findall(r'href="(/companies/\d+[^"]*)"', html)
-    seen = set()
-    for url in urls:
-        if url in seen:
-            continue
-        seen.add(url)
-        full_url = f"https://homestars.com{url}"
-        # Try to extract name from URL slug
-        m = re.match(r'/companies/(\d+)-(.+)', url)
-        name = ""
-        if m:
-            name = m.group(2).replace('-', ' ').title()
-        listings.append({
-            "company": name,
-            "category": "",
-            "url": "",
-            "emails": [],
-            "phones": [],
-            "address": "",
-            "hours": "",
-            "google_rating": None,
-            "google_reviews": None,
-            "homestars_rating": None,
-            "homestars_reviews": None,
-            "homestars_url": full_url,
-            "homestars_verified": False,
-            "homestars_years": None,
-            "socials": {},
-            "price_level": "",
-            "description": "",
-        })
-
-    return listings
-
-
-def _parse_detail_from_html(html: str, md: str) -> dict:
-    """Fallback: extract company details from rendered HTML."""
-    result = {}
+def _parse_profile_from_html(html: str, md: str, homestars_url: str) -> dict:
+    """Fallback: extract company data from rendered HTML/markdown."""
+    result = {
+        "company": "",
+        "category": "",
+        "url": "",
+        "emails": [],
+        "phones": [],
+        "address": "",
+        "hours": "",
+        "google_rating": None,
+        "google_reviews": None,
+        "homestars_rating": None,
+        "homestars_reviews": None,
+        "homestars_url": homestars_url,
+        "homestars_verified": False,
+        "homestars_years": None,
+        "socials": {},
+        "price_level": "",
+        "description": "",
+    }
 
     # Company name from h1
     m = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
     if m:
         result["company"] = m.group(1).strip()
 
-    # Phone
+    # Try name from URL slug as last resort
+    if not result["company"]:
+        m = re.search(r'/companies/\d+-(.+?)(?:\?|$)', homestars_url)
+        if m:
+            result["company"] = m.group(1).replace('-', ' ').title()
+
+    # Phone from HTML/markdown
     phones = extract_phones(md or html)
     if phones:
         result["phones"] = phones
 
-    # Rating
-    m = re.search(r'(\d+\.?\d*)\s*/\s*10', html) or re.search(r'Star\s*Score[:\s]*(\d+\.?\d*)', html, re.I)
+    # Rating — "X.X / 10" or "Star Score: X.X"
+    m = re.search(r'(\d+\.?\d*)\s*/\s*10', html)
+    if not m:
+        m = re.search(r'Star\s*Score[:\s]*(\d+\.?\d*)', html, re.I)
     if m:
         try:
             result["homestars_rating"] = round(float(m.group(1)), 1)
@@ -466,57 +454,29 @@ def _parse_detail_from_html(html: str, md: str) -> dict:
         except ValueError:
             pass
 
+    # Emails
+    emails = extract_emails(md or html)
+    if emails:
+        result["emails"] = emails
+
+    # Description from markdown (first substantial paragraph)
+    if md:
+        desc = extract_description(md)
+        if desc:
+            result["description"] = desc
+
     return result
 
 
-# ── Main scraper functions ────────────────────────────────────────────
-
-async def _scrape_search_page(
-    crawler: AsyncWebCrawler,
-    url: str,
-    rate_limiter: DomainRateLimiter,
-) -> tuple[list[dict], int | None]:
-    """Scrape a single search results page. Returns (listings, total_count)."""
-    run_config = CrawlerRunConfig(
-        js_code=DISMISS_COOKIE_JS + "\n" + EXTRACT_NEXT_DATA_JS,
-        wait_for="css:body",
-        page_timeout=30000,
-    )
-
-    result, err = await _crawl_with_retry(
-        crawler, url, run_config,
-        max_retries=3, timeout=45,
-        rate_limiter=rate_limiter,
-    )
-
-    if err or not result.success:
-        log.warning(f"Failed to load search page: {url} (error: {err})")
-        return [], None
-
-    html = result.html or ""
-    next_data = _extract_next_data(html)
-
-    if next_data:
-        listings = _parse_listings_from_next_data(next_data)
-        total = _extract_total_results(next_data)
-        if listings:
-            log.info(f"Extracted {len(listings)} listings from __NEXT_DATA__ (total: {total})")
-            return listings, total
-
-    # Fallback to HTML parsing
-    listings = _parse_listings_from_html(html)
-    log.info(f"Extracted {len(listings)} listings from HTML fallback")
-    return listings, None
-
-
-async def _scrape_detail_page(
+async def _scrape_profile(
     crawler: AsyncWebCrawler,
     homestars_url: str,
     rate_limiter: DomainRateLimiter,
-) -> dict:
-    """Scrape a single company profile page for full details."""
+    dump_first: bool = False,
+) -> dict | None:
+    """Scrape a single HomeStars company profile page."""
     run_config = CrawlerRunConfig(
-        js_code=DISMISS_COOKIE_JS + "\n" + EXTRACT_NEXT_DATA_JS,
+        js_code=CONSENT_JS + "\n" + EXTRACT_NEXT_DATA_JS,
         wait_for="css:body",
         page_timeout=30000,
     )
@@ -528,21 +488,49 @@ async def _scrape_detail_page(
     )
 
     if err or not result.success:
-        log.warning(f"Failed to load detail page: {homestars_url} (error: {err})")
-        return {}
+        log.warning(f"Failed to load profile: {homestars_url} (error: {err})")
+        if result and result.html:
+            _dump_debug("profile_fail", result.html)
+        return None
 
     html = result.html or ""
-    md = result.markdown_v2.raw_markdown if hasattr(result, 'markdown_v2') and result.markdown_v2 else ""
+    md = ""
+    try:
+        md = result.markdown_v2.raw_markdown if result.markdown_v2 else ""
+    except Exception:
+        pass
+
+    # Dump first profile for debugging
+    if dump_first:
+        _dump_debug("profile_html", html)
+        if md:
+            _dump_debug("profile_md", md)
+
+    # Try __NEXT_DATA__ extraction
     next_data = _extract_next_data(html)
-
     if next_data:
-        detail = _parse_detail_from_next_data(next_data)
-        if detail:
-            return detail
+        if dump_first:
+            _dump_json_debug("profile_next_data", next_data)
 
-    # Fallback
-    return _parse_detail_from_html(html, md)
+        lead = _parse_profile_from_next_data(next_data, homestars_url)
+        if lead and lead.get("company"):
+            log.info(f"Extracted from __NEXT_DATA__: {lead['company']}")
+            return lead
+        else:
+            log.info("__NEXT_DATA__ found but couldn't parse company data")
 
+    # Fallback to HTML/markdown parsing
+    lead = _parse_profile_from_html(html, md, homestars_url)
+    if lead.get("company"):
+        log.info(f"Extracted from HTML fallback: {lead['company']}")
+    else:
+        log.warning(f"Could not extract company data from {homestars_url}")
+        _dump_debug("profile_empty", html)
+
+    return lead if lead.get("company") else None
+
+
+# ── Main entry points ─────────────────────────────────────────────────
 
 async def scrape_homestars(
     keyword: str,
@@ -554,10 +542,10 @@ async def scrape_homestars(
     on_progress: Callable | None = None,
 ) -> list[dict]:
     """
-    Scrape HomeStars listings for a keyword in a single city.
+    Scrape HomeStars listings via Google search + profile scraping.
 
     Args:
-        keyword: Service category (e.g. "plumbing", "electrical")
+        keyword: Search keyword (e.g. "plumber", "electrician")
         city: City name (e.g. "Toronto")
         province_name: Full province name (e.g. "Ontario")
         max_results: Maximum listings to return
@@ -566,156 +554,122 @@ async def scrape_homestars(
         on_progress: Callback(current, total, message)
     """
     config = config or ScrapeConfig()
-    province_code = PROVINCE_CODES.get(province_name, "on")
-    rate_limiter = DomainRateLimiter(min_delay=2.5)
+    google_limiter = DomainRateLimiter(min_delay=3.0)
+    hs_limiter = DomainRateLimiter(min_delay=2.0)
     browser_config = _make_hs_browser_config(config)
-
-    all_listings = []
-    seen_urls = set()
-    page = 1
-    max_pages = 20  # Safety limit
-    total_estimate = None
 
     def _progress(current, total, msg):
         if on_progress:
             on_progress(current, total, msg)
 
-    _progress(0, max_results, f"Searching HomeStars for '{keyword}' in {city}, {province_name}...")
+    _progress(0, max_results, f"Searching Google for HomeStars '{keyword}' in {city}...")
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        # Phase 1: Collect listings from search pages
-        while len(all_listings) < max_results and page <= max_pages:
-            url = _build_search_url(keyword, city, province_code, page)
-            _progress(len(all_listings), max_results,
-                      f"Loading search page {page}...")
+        # Phase 1: Find HomeStars profile URLs via Google
+        profile_urls = await _google_search_homestars(
+            crawler, keyword, city, google_limiter,
+            max_results=max_results,
+            on_log=lambda msg: _progress(0, max_results, msg),
+        )
 
-            page_listings, total = await _scrape_search_page(crawler, url, rate_limiter)
-
-            if total is not None and total_estimate is None:
-                total_estimate = min(total, max_results)
-                log.info(f"Total results available: {total}")
-
-            if not page_listings:
-                log.info(f"No more listings on page {page}, stopping pagination")
-                break
-
-            new_count = 0
-            for listing in page_listings:
-                hs_url = listing.get("homestars_url", "")
-                if hs_url and hs_url in seen_urls:
-                    continue
-                if hs_url:
-                    seen_urls.add(hs_url)
-                all_listings.append(listing)
-                new_count += 1
-                if len(all_listings) >= max_results:
-                    break
-
-            log.info(f"Page {page}: {new_count} new listings ({len(all_listings)} total)")
-            _progress(len(all_listings), total_estimate or max_results,
-                      f"Found {len(all_listings)} listings (page {page})...")
-
-            if new_count == 0:
-                break
-
-            page += 1
-            # Random delay between pages
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-
-        if not all_listings:
-            _progress(0, 1, "No listings found on HomeStars")
+        if not profile_urls:
+            _progress(0, 1, f"No HomeStars results found for '{keyword}' in {city}")
             return []
 
-        log.info(f"Collected {len(all_listings)} listings, now fetching details...")
+        log.info(f"Found {len(profile_urls)} HomeStars profiles to scrape")
+        _progress(0, len(profile_urls), f"Found {len(profile_urls)} profiles, scraping details...")
 
-        # Phase 2: Fetch detail pages for richer data
+        # Phase 2: Scrape each profile page
         sem = asyncio.Semaphore(max(config.concurrency, 3))
-        detail_count = 0
-        total_details = len(all_listings)
+        scraped = 0
+        all_leads = []
 
-        async def fetch_detail(i: int, listing: dict) -> dict:
-            nonlocal detail_count
-            hs_url = listing.get("homestars_url", "")
-            if not hs_url:
-                return listing
-
+        async def scrape_one(i: int, url: str) -> dict | None:
+            nonlocal scraped
             async with sem:
-                detail = await _scrape_detail_page(crawler, hs_url, rate_limiter)
-                detail_count += 1
-                _progress(
-                    detail_count, total_details,
-                    f"Fetching details ({detail_count}/{total_details})..."
+                lead = await _scrape_profile(
+                    crawler, url, hs_limiter,
+                    dump_first=(i == 0),  # Dump first profile for debugging
                 )
+                scraped += 1
+                _progress(scraped, len(profile_urls),
+                          f"Scraping profiles ({scraped}/{len(profile_urls)})...")
+                return lead
 
-            if detail:
-                # Merge detail data into listing (detail wins for non-empty fields)
-                for k, v in detail.items():
-                    if v and (not listing.get(k) or k in ("description", "phones", "homestars_rating",
-                                                           "homestars_reviews", "homestars_verified")):
-                        listing[k] = v
+        tasks = [scrape_one(i, url) for i, url in enumerate(profile_urls)]
+        results = await asyncio.gather(*tasks)
 
-            return listing
+        for lead in results:
+            if lead:
+                all_leads.append(lead)
 
-        tasks = [fetch_detail(i, l) for i, l in enumerate(all_listings)]
-        all_listings = await asyncio.gather(*tasks)
+        log.info(f"Scraped {len(all_leads)} leads from {len(profile_urls)} profiles")
 
-        # Phase 3: Optional website enrichment for emails/socials
-        if enrich_websites:
+        # Phase 3: Optional website enrichment
+        if enrich_websites and all_leads:
+            enrichable = [l for l in all_leads if l.get("url")]
+            enrich_total = len(enrichable)
             enriched = 0
-            enrich_total = sum(1 for l in all_listings if l.get("url"))
-            _progress(0, enrich_total or 1, "Enriching with website data...")
 
-            async def enrich_one(listing: dict) -> dict:
-                nonlocal enriched
-                website = listing.get("url", "")
-                if not website:
+            if enrich_total > 0:
+                _progress(0, enrich_total, "Enriching with website data...")
+
+                async def enrich_one(listing: dict) -> dict:
+                    nonlocal enriched
+                    website = listing.get("url", "")
+                    if not website:
+                        return listing
+
+                    async with sem:
+                        try:
+                            run_config = CrawlerRunConfig(
+                                wait_for="css:body",
+                                page_timeout=20000,
+                            )
+                            res, err = await _crawl_with_retry(
+                                crawler, website, run_config,
+                                max_retries=2, timeout=20,
+                                rate_limiter=hs_limiter,
+                            )
+                            if not err and res.success:
+                                text = ""
+                                try:
+                                    text = res.markdown_v2.raw_markdown if res.markdown_v2 else ""
+                                except Exception:
+                                    pass
+                                page_html = res.html or ""
+
+                                emails = extract_emails(text or page_html)
+                                if emails:
+                                    listing["emails"] = list(set(listing.get("emails", []) + emails))
+
+                                phones_found = extract_phones(text or page_html)
+                                if phones_found:
+                                    listing["phones"] = list(set(listing.get("phones", []) + phones_found))
+
+                                socials = extract_social_links(page_html)
+                                if socials:
+                                    listing["socials"] = {**listing.get("socials", {}), **socials}
+
+                                desc = extract_description(text)
+                                if desc and not listing.get("description"):
+                                    listing["description"] = desc
+                        except Exception as e:
+                            log.warning(f"Enrich error for {website}: {e}")
+
+                        enriched += 1
+                        _progress(enriched, enrich_total,
+                                  f"Enriching websites ({enriched}/{enrich_total})...")
+
                     return listing
 
-                async with sem:
-                    try:
-                        run_config = CrawlerRunConfig(
-                            wait_for="css:body",
-                            page_timeout=20000,
-                        )
-                        res, err = await _crawl_with_retry(
-                            crawler, website, run_config,
-                            max_retries=2, timeout=20,
-                            rate_limiter=rate_limiter,
-                        )
-                        if not err and res.success:
-                            text = res.markdown_v2.raw_markdown if hasattr(res, 'markdown_v2') and res.markdown_v2 else ""
-                            html = res.html or ""
+                tasks = [enrich_one(l) for l in all_leads]
+                all_leads = list(await asyncio.gather(*tasks))
 
-                            emails = extract_emails(text or html)
-                            if emails:
-                                listing["emails"] = list(set(listing.get("emails", []) + emails))
+    _progress(len(all_leads), len(all_leads),
+              f"Done — {len(all_leads)} leads from HomeStars")
 
-                            phones_found = extract_phones(text or html)
-                            if phones_found:
-                                listing["phones"] = list(set(listing.get("phones", []) + phones_found))
-
-                            socials = extract_social_links(html)
-                            if socials:
-                                listing["socials"] = {**listing.get("socials", {}), **socials}
-
-                            desc = extract_description(text)
-                            if desc and not listing.get("description"):
-                                listing["description"] = desc
-                    except Exception as e:
-                        log.warning(f"Enrich error for {website}: {e}")
-
-                    enriched += 1
-                    _progress(enriched, enrich_total, f"Enriching websites ({enriched}/{enrich_total})...")
-
-                return listing
-
-            tasks = [enrich_one(l) for l in all_listings]
-            all_listings = await asyncio.gather(*tasks)
-
-    _progress(len(all_listings), len(all_listings),
-              f"Done — {len(all_listings)} listings from HomeStars")
-
-    return list(all_listings)
+    return all_leads
 
 
 async def scrape_homestars_multi_city(
@@ -727,10 +681,10 @@ async def scrape_homestars_multi_city(
     on_progress: Callable | None = None,
 ) -> list[dict]:
     """
-    Scrape HomeStars across multiple cities.
+    Scrape HomeStars across multiple cities via Google search.
 
     Args:
-        keyword: Service category
+        keyword: Search keyword
         cities: List of dicts with 'city' and 'province_name' keys
         max_per_city: Max listings per city
         enrich_websites: Visit business websites
