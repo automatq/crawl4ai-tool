@@ -40,6 +40,77 @@ def _get_cities_db():
     return conn
 
 
+# ── Run history database ──────────────────────────────────────────────
+
+RUNS_DB = Path(os.environ.get("RUNS_DB", "/data/scraper.db"))
+RUNS_DB.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _get_runs_db():
+    """Return a sqlite3 connection to the run history database."""
+    conn = sqlite3.connect(str(RUNS_DB))
+    conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        mode TEXT,
+        keyword TEXT,
+        cities TEXT,
+        status TEXT DEFAULT 'running',
+        lead_count INTEGER DEFAULT 0,
+        duration_seconds REAL,
+        created_at TEXT,
+        finished_at TEXT,
+        grid_spacing_km REAL,
+        max_results INTEGER,
+        error TEXT,
+        backup_filename TEXT
+    )""")
+    conn.commit()
+    # Migration for existing tables missing backup_filename
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN backup_filename TEXT")
+        conn.commit()
+    except Exception:
+        pass
+    return conn
+
+
+def _log_run_start(job: "Job"):
+    """Insert a new run record when a job starts."""
+    ic = job.input_config
+    city_ids = ic.get("city_ids")
+    cities = json.dumps(city_ids) if city_ids else ic.get("city", "")
+    try:
+        conn = _get_runs_db()
+        conn.execute(
+            "INSERT INTO runs (run_id, mode, keyword, cities, status, created_at, grid_spacing_km, max_results) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (job.id, ic.get("mode", ""), ic.get("keyword", ""), cities, "running",
+             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.created_at)),
+             ic.get("grid_spacing_km"), ic.get("max_results")),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[RUN LOG] start error: {e}", flush=True)
+
+
+def _log_run_finish(job: "Job"):
+    """Update the run record when a job finishes."""
+    try:
+        conn = _get_runs_db()
+        conn.execute(
+            "UPDATE runs SET status=?, lead_count=?, duration_seconds=?, finished_at=?, error=? WHERE run_id=?",
+            (job.status, len(job.results), round(job.duration, 1),
+             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.finished_at)),
+             job.error or None, job.id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[RUN LOG] finish error: {e}", flush=True)
+
+
 # ── Persistent backup to Railway volume ──────────────────────────────
 
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/data/backups"))
@@ -71,6 +142,14 @@ def _save_backup(job: "Job"):
         backup_path = BACKUP_DIR / filename
         backup_path.write_text(json.dumps(payload, indent=2, default=str))
         job.log(f"Backup saved: {filename}")
+        # Link backup file to run record
+        try:
+            db = _get_runs_db()
+            db.execute("UPDATE runs SET backup_filename=? WHERE run_id=?", (filename, job.id))
+            db.commit()
+            db.close()
+        except Exception:
+            pass
     except Exception as e:
         job.log(f"Backup failed: {e}", "error")
 
@@ -134,11 +213,23 @@ for _i in range(_NUM_WORKERS):
     _t.start()
 
 
+def _purge_old_backups(max_age_days=3):
+    """Delete backup JSON files older than max_age_days."""
+    cutoff = time.time() - (max_age_days * 86400)
+    for f in BACKUP_DIR.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except Exception:
+            pass
+
+
 def _cleanup_old_jobs():
     cutoff = time.time() - 3600
     stale = [jid for jid, j in jobs.items() if j.created_at < cutoff]
     for jid in stale:
         del jobs[jid]
+    _purge_old_backups()
 
 
 def _create_job(**input_config) -> Job:
@@ -223,6 +314,7 @@ def _run_outreach_phase(job: Job, leads: list[dict], cfg: ScrapeConfig) -> list[
 
 
 def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
+    _log_run_start(job)
     try:
         cfg = _make_config(job.input_config)
 
@@ -256,6 +348,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
                 job.progress_msg = "Cancelled"
                 job.finished_at = time.time()
             job.log("Cancelled by user", "warn")
+            _log_run_finish(job)
             return
 
         if not urls:
@@ -265,6 +358,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
                 job.progress_msg = "No business sites found."
                 job.finished_at = time.time()
             job.log("No business sites found", "warn")
+            _log_run_finish(job)
             return
 
         job.log(f"Found {len(urls)} unique business URLs")
@@ -296,6 +390,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.finished_at = time.time()
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _log_run_finish(job)
 
     except InterruptedError:
         with job.lock:
@@ -303,6 +398,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.progress_msg = "Cancelled by user."
             job.finished_at = time.time()
         job.log("Cancelled by user", "warn")
+        _log_run_finish(job)
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -310,6 +406,7 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
+        _log_run_finish(job)
 
 
 def _map_source_record(rec: dict) -> dict:
@@ -442,6 +539,7 @@ def _run_import_job(job: Job, records: list[dict]):
 
 def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
     """Run a Google Maps scraping job."""
+    _log_run_start(job)
     try:
         cfg = _make_config(job.input_config)
         ic = job.input_config
@@ -508,6 +606,7 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
 
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _log_run_finish(job)
 
     except InterruptedError:
         with job.lock:
@@ -515,6 +614,7 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
             job.progress_msg = "Cancelled by user."
             job.finished_at = time.time()
         job.log("Cancelled by user", "warn")
+        _log_run_finish(job)
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -522,11 +622,13 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
+        _log_run_finish(job)
 
 
 def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
                               max_per_city: int, grid_spacing_km: float, enrich: bool):
     """Run polygon area search across multiple cities from the database."""
+    _log_run_start(job)
     try:
         cfg = _make_config(job.input_config)
 
@@ -617,6 +719,7 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
 
         job.log(f"Completed: {len(all_leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _log_run_finish(job)
 
     except InterruptedError:
         with job.lock:
@@ -624,6 +727,7 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
             job.progress_msg = "Cancelled by user."
             job.finished_at = time.time()
         job.log("Cancelled by user", "warn")
+        _log_run_finish(job)
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -631,9 +735,11 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
+        _log_run_finish(job)
 
 
 def _run_url_job(job: Job, urls: list[str]):
+    _log_run_start(job)
     try:
         cfg = _make_config(job.input_config)
 
@@ -667,6 +773,7 @@ def _run_url_job(job: Job, urls: list[str]):
             job.finished_at = time.time()
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _log_run_finish(job)
 
     except InterruptedError:
         with job.lock:
@@ -674,6 +781,7 @@ def _run_url_job(job: Job, urls: list[str]):
             job.progress_msg = "Cancelled by user."
             job.finished_at = time.time()
         job.log("Cancelled by user", "warn")
+        _log_run_finish(job)
     except Exception as e:
         with job.lock:
             job.status = "error"
@@ -681,6 +789,7 @@ def _run_url_job(job: Job, urls: list[str]):
             job.progress_msg = f"Error: {e}"
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
+        _log_run_finish(job)
 
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -929,17 +1038,11 @@ def api_results(job_id):
     )
 
 
-@app.get("/api/export/<job_id>")
-def api_export(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify(error="Job not found"), 404
-
-    fmt = request.args.get("format", "csv")
-
+def _export_leads(leads, fmt="csv"):
+    """Export a list of leads as CSV or JSON Response."""
     if fmt == "json":
         return Response(
-            json.dumps(job.results, indent=2),
+            json.dumps(leads, indent=2),
             mimetype="application/json",
             headers={"Content-Disposition": "attachment; filename=leads.json"},
         )
@@ -956,7 +1059,7 @@ def api_export(job_id):
         "price_level", "maps_url", "latitude", "longitude",
         "place_id", "plus_code", "is_closed",
     ])
-    for lead in job.results:
+    for lead in leads:
         if "error" in lead:
             continue
         is_closed = lead.get("is_temporarily_closed") or lead.get("is_permanently_closed")
@@ -991,6 +1094,80 @@ def api_export(job_id):
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=leads.csv"},
     )
+
+
+@app.get("/api/export/<job_id>")
+def api_export(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error="Job not found"), 404
+    return _export_leads(job.results, request.args.get("format", "csv"))
+
+
+def _get_run_leads(run_id):
+    """Look up leads for a run from in-memory jobs or backup files."""
+    # Try in-memory job first
+    job = jobs.get(run_id)
+    if job and job.results:
+        return job.results
+
+    # Try backup file linked in DB
+    conn = _get_runs_db()
+    row = conn.execute("SELECT backup_filename FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    conn.close()
+
+    if row and row["backup_filename"]:
+        path = BACKUP_DIR / row["backup_filename"]
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                return data.get("leads", [])
+            except Exception:
+                pass
+
+    # Fallback: scan backups for matching job_id
+    for f in BACKUP_DIR.glob(f"*_{run_id}_*.json"):
+        try:
+            data = json.loads(f.read_text())
+            return data.get("leads", [])
+        except Exception:
+            continue
+
+    return None
+
+
+@app.get("/api/runs")
+def api_runs():
+    """List run history from the persistent database."""
+    conn = _get_runs_db()
+    rows = conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 100").fetchall()
+    conn.close()
+    return jsonify(runs=[dict(r) for r in rows])
+
+
+@app.get("/api/runs/<run_id>")
+def api_run_detail(run_id):
+    """Return run metadata + leads (if backup still available)."""
+    conn = _get_runs_db()
+    row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error="Run not found"), 404
+
+    result = dict(row)
+    leads = _get_run_leads(run_id)
+    result["leads"] = leads
+    result["backup_expired"] = leads is None
+    return jsonify(result)
+
+
+@app.get("/api/export/run/<run_id>")
+def api_export_run(run_id):
+    """Export leads from a historical run."""
+    leads = _get_run_leads(run_id)
+    if leads is None:
+        return jsonify(error="Lead data expired or not found"), 410
+    return _export_leads(leads, request.args.get("format", "csv"))
 
 
 @app.get("/api/backups")

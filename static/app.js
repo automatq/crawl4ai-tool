@@ -370,6 +370,7 @@ function connectSSE(jobId) {
       } else {
         setStatus("error");
       }
+      loadRunHistory();
     }
   };
 
@@ -404,8 +405,8 @@ async function fetchResults(jobId) {
   }
 }
 
-function renderResults(data) {
-  const body = $("#results-body");
+function renderResults(data, targetBody = "#results-body") {
+  const body = $(targetBody);
   body.innerHTML = "";
   data.forEach((lead) => {
     const tr = document.createElement("tr");
@@ -635,3 +636,183 @@ function showToast(msg, level = "info") {
   clearTimeout(toast._timer);
   toast._timer = setTimeout(() => (toast.className = "toast"), 2500);
 }
+
+// ── Run History ───────────────────────────────────────────────────────
+
+function fmtDuration(seconds) {
+  if (!seconds) return "—";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.round(seconds % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m === 0) return `${s}s`;
+  return `${m}m ${s}s`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function statusBadge(status) {
+  const colors = { completed: "#22c55e", done: "#22c55e", running: "#3b82f6", error: "#ef4444", cancelled: "#9ca3af", failed: "#ef4444" };
+  const color = colors[status] || "#9ca3af";
+  return `<span style="color:${color};font-weight:600">${esc(status)}</span>`;
+}
+
+function statusIcon(status) {
+  if (status === "done" || status === "completed")
+    return '<span class="status-icon status-success">&#10003;</span>';
+  if (status === "error" || status === "failed")
+    return '<span class="status-icon status-error">&#10007;</span>';
+  if (status === "running")
+    return '<span class="status-icon status-running">&#9679;</span>';
+  return '<span class="status-icon status-neutral">&mdash;</span>';
+}
+
+async function loadRunHistory() {
+  try {
+    const resp = await fetch("/api/runs");
+    const data = await resp.json();
+    const runs = data.runs || [];
+    const body = $("#history-body");
+    const empty = $("#history-empty");
+    const wrap = $("#history-table-wrap");
+
+    if (runs.length === 0) {
+      empty.hidden = false;
+      wrap.hidden = true;
+      return;
+    }
+
+    empty.hidden = true;
+    wrap.hidden = false;
+    body.innerHTML = runs.map(r => {
+      let cities = r.cities || "—";
+      try {
+        const arr = JSON.parse(cities);
+        if (Array.isArray(arr)) cities = `${arr.length} cities`;
+      } catch {}
+      return `<tr data-run-id="${esc(r.run_id)}" class="history-row-clickable">
+        <td>${statusIcon(r.status)} ${statusBadge(r.status)}</td>
+        <td>${esc(r.mode || "—")}</td>
+        <td>${esc(r.keyword || "—")}</td>
+        <td>${esc(cities)}</td>
+        <td>${r.lead_count ?? "—"}</td>
+        <td>${fmtDate(r.created_at)}</td>
+        <td>${fmtDuration(r.duration_seconds)}</td>
+      </tr>`;
+    }).join("");
+
+    body.querySelectorAll("tr[data-run-id]").forEach(tr => {
+      tr.addEventListener("click", () => showRunDetail(tr.dataset.runId));
+    });
+  } catch (err) {
+    console.error("Failed to load run history:", err);
+  }
+}
+
+// ── Run Detail View ──────────────────────────────────────────────────
+
+let detailLeads = [];
+let detailRunId = null;
+
+async function showRunDetail(runId) {
+  detailRunId = runId;
+  $("#history-list-view").hidden = true;
+  $("#history-detail-view").hidden = false;
+
+  // Loading state
+  $("#detail-status").textContent = "Loading...";
+  $("#detail-mode").textContent = "";
+  $("#detail-keyword").textContent = "";
+  $("#detail-lead-count").textContent = "";
+  $("#detail-started").textContent = "";
+  $("#detail-duration").textContent = "";
+  $("#detail-toolbar").hidden = true;
+  $("#detail-table-wrap").hidden = true;
+  $("#detail-expired").hidden = true;
+
+  try {
+    const resp = await fetch(`/api/runs/${runId}`);
+    const data = await resp.json();
+    if (data.error) {
+      showToast(data.error, "error");
+      return;
+    }
+
+    // Populate header
+    $("#detail-status").innerHTML = statusIcon(data.status) + " " + statusBadge(data.status);
+    $("#detail-mode").textContent = data.mode || "—";
+    $("#detail-keyword").textContent = data.keyword || "—";
+    $("#detail-lead-count").textContent = data.lead_count ?? "—";
+    $("#detail-started").textContent = fmtDate(data.created_at);
+    $("#detail-duration").textContent = fmtDuration(data.duration_seconds);
+
+    if (data.leads && data.leads.length > 0) {
+      detailLeads = data.leads;
+      renderResults(detailLeads, "#detail-results-body");
+      $("#detail-toolbar").hidden = false;
+      $("#detail-table-wrap").hidden = false;
+      $("#detail-results-count").textContent = `${detailLeads.length} results`;
+    } else if (data.backup_expired) {
+      detailLeads = [];
+      $("#detail-expired").hidden = false;
+    } else {
+      detailLeads = [];
+      $("#detail-expired").hidden = false;
+    }
+  } catch (err) {
+    showToast("Failed to load run: " + err.message, "error");
+  }
+}
+
+// Back button
+$("#history-back-btn").addEventListener("click", () => {
+  $("#history-detail-view").hidden = true;
+  $("#history-list-view").hidden = false;
+  detailRunId = null;
+  detailLeads = [];
+});
+
+// Detail export buttons
+$("#detail-export-csv-btn").addEventListener("click", () => {
+  if (detailRunId) window.location.href = `/api/export/run/${detailRunId}?format=csv`;
+});
+
+$("#detail-export-json-btn").addEventListener("click", () => {
+  if (detailRunId) window.location.href = `/api/export/run/${detailRunId}?format=json`;
+});
+
+// Copy emails from detail view
+$("#detail-copy-emails-btn").addEventListener("click", () => {
+  const all = new Set();
+  detailLeads.forEach(l => (l.emails || []).forEach(e => all.add(e)));
+  if (!all.size) return showToast("No emails to copy", "warn");
+  navigator.clipboard.writeText([...all].sort().join("\n"));
+  showToast(`Copied ${all.size} email${all.size !== 1 ? "s" : ""}`);
+});
+
+// Filter in detail view
+$("#detail-filter-input").addEventListener("input", () => {
+  const q = $("#detail-filter-input").value.toLowerCase();
+  if (!q) {
+    renderResults(detailLeads, "#detail-results-body");
+    $("#detail-results-count").textContent = `${detailLeads.length} results`;
+    return;
+  }
+  const filtered = detailLeads.filter(lead => {
+    const text = [
+      lead.company, lead.url, lead.category || "",
+      (lead.emails || []).join(" "), (lead.phones || []).join(" "),
+      lead.address || "",
+    ].join(" ").toLowerCase();
+    return text.includes(q);
+  });
+  renderResults(filtered, "#detail-results-body");
+  $("#detail-results-count").textContent = `${filtered.length} of ${detailLeads.length} results`;
+});
+
+// Load history on page init
+loadRunHistory();

@@ -775,6 +775,120 @@ textarea:focus {
 .toast-warn     { background: var(--color-warning); color: #1a1a2e; }
 .toast-error    { background: var(--color-error); }
 
+/* ── Run History ──────────────────────────────────────────────────── */
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.history-table th {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.history-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-row-clickable {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.history-row-clickable:hover td {
+  background: #f0f4ff;
+}
+
+.status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.status-success { background: #d1fae5; color: #065f46; }
+.status-error   { background: #fee2e2; color: #991b1b; }
+.status-running { background: #dbeafe; color: #1e40af; font-size: 8px; }
+.status-neutral { background: #f3f4f6; color: #6b7280; }
+
+#panel-history h3 {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+}
+
+/* ── Run Detail View ─────────────────────────────────────────────── */
+
+#history-back-btn {
+  margin-bottom: 16px;
+}
+
+.run-detail-header {
+  margin-bottom: 16px;
+}
+
+.run-detail-header .run-info-bar {
+  flex-wrap: wrap;
+}
+
+#detail-results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+#detail-results-table th {
+  padding: 10px 14px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  background: var(--bg-body);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+#detail-results-table td {
+  padding: 9px 14px;
+  border-bottom: 1px solid #f3f4f6;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+#detail-results-table tr:hover td {
+  background: #f9fafb;
+}
+
+#detail-results-table .cell-copy {
+  cursor: pointer;
+}
+
+#detail-results-table .cell-copy:hover {
+  background: #eef2ff;
+}
+
 /* ── Responsive ───────────────────────────────────────────────────── */
 
 @media (max-width: 640px) {

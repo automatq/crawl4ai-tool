@@ -28,6 +28,7 @@
     <button class="tab active" data-tab="input">Input</button>
     <button class="tab" data-tab="run">Run</button>
     <button class="tab" data-tab="dataset">Dataset</button>
+    <button class="tab" data-tab="history">History</button>
   </nav>
 
   <main>
@@ -301,6 +302,90 @@
           <tbody id="results-body"></tbody>
         </table>
       </div>
+    </section>
+
+    <!-- ── HISTORY TAB ────────────────────────────────────────── -->
+    <section id="panel-history" class="panel" hidden>
+
+      <!-- Runs list view -->
+      <div id="history-list-view">
+        <h3>Run History</h3>
+        <div id="history-empty" class="dataset-empty">
+          <p>No runs recorded yet.</p>
+        </div>
+        <div class="table-wrap" id="history-table-wrap" hidden>
+          <table id="history-table" class="history-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Mode</th>
+                <th>Keyword</th>
+                <th>Cities</th>
+                <th>Results</th>
+                <th>Started</th>
+                <th>Duration</th>
+              </tr>
+            </thead>
+            <tbody id="history-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Run detail view -->
+      <div id="history-detail-view" hidden>
+        <button id="history-back-btn" class="btn btn-outline btn-sm">&#8592; Back to runs</button>
+
+        <div class="run-detail-header">
+          <div class="run-info-bar">
+            <div class="run-stat"><span class="run-stat-label">Status</span><span id="detail-status"></span></div>
+            <div class="run-stat"><span class="run-stat-label">Mode</span><span id="detail-mode"></span></div>
+            <div class="run-stat"><span class="run-stat-label">Keyword</span><span id="detail-keyword"></span></div>
+            <div class="run-stat"><span class="run-stat-label">Results</span><span id="detail-lead-count"></span></div>
+            <div class="run-stat"><span class="run-stat-label">Started</span><span id="detail-started"></span></div>
+            <div class="run-stat"><span class="run-stat-label">Duration</span><span id="detail-duration"></span></div>
+          </div>
+        </div>
+
+        <div class="dataset-toolbar" id="detail-toolbar" hidden>
+          <div class="dataset-toolbar-left">
+            <input type="search" id="detail-filter-input" placeholder="Filter results..." class="filter-input">
+            <span id="detail-results-count" class="results-count"></span>
+          </div>
+          <div class="dataset-toolbar-right">
+            <button id="detail-copy-emails-btn" class="btn btn-outline btn-sm">Copy Emails</button>
+            <button id="detail-export-csv-btn" class="btn btn-outline btn-sm">CSV</button>
+            <button id="detail-export-json-btn" class="btn btn-outline btn-sm">JSON</button>
+          </div>
+        </div>
+
+        <div id="detail-expired" class="dataset-empty" hidden>
+          <p>Lead data expired (backups are kept for 3 days). Run metadata is preserved above.</p>
+        </div>
+
+        <div class="table-wrap" id="detail-table-wrap" hidden>
+          <table id="detail-results-table">
+            <thead>
+              <tr>
+                <th>Company</th>
+                <th>Category</th>
+                <th>URL</th>
+                <th>Emails</th>
+                <th>Phones</th>
+                <th>Address</th>
+                <th>Hours</th>
+                <th>Reviews</th>
+                <th>Rating</th>
+                <th>Price</th>
+                <th>Socials</th>
+                <th>Outreach</th>
+                <th>Maps</th>
+              </tr>
+            </thead>
+            <tbody id="detail-results-body"></tbody>
+          </table>
+        </div>
+      </div>
+
     </section>
 
   </main>
