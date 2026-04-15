@@ -512,6 +512,26 @@ def _parse_listing_detail(html: str, md: str, maps_url: str) -> dict:
             pid_match = _PLACE_ID_RE.search(maps_url)
             if pid_match:
                 js_detail["place_id"] = pid_match.group(0)
+
+        # Fill missing phone/address/website from HTML regex fallback
+        if "phone" not in js_detail:
+            phone_match = re.search(r'aria-label="Phone[:\s]*([^"]+)"', html, re.I)
+            if phone_match:
+                js_detail["phone"] = phone_match.group(1).strip()
+            else:
+                phones = _PHONE_RE.findall(md)
+                if phones:
+                    js_detail["phone"] = phones[0].strip()
+        if "address" not in js_detail:
+            addr_match = re.search(r'aria-label="Address[:\s]*([^"]+)"', html, re.I)
+            if addr_match:
+                js_detail["address"] = addr_match.group(1).strip()
+                _parse_address_components(js_detail["address"], js_detail)
+        if "website" not in js_detail:
+            web_match = re.search(r'aria-label="Website[:\s]*([^"]+)"', html, re.I)
+            if web_match:
+                js_detail["website"] = web_match.group(1).strip()
+
         return js_detail
 
     # Fallback: regex on HTML + markdown
