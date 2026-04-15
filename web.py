@@ -30,7 +30,23 @@ from outreach import run_outreach
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
-app.secret_key = os.environ.get("SECRET_KEY", uuid4().hex + uuid4().hex)
+def _get_secret_key():
+    """Get a stable secret key that persists across redeploys."""
+    if os.environ.get("SECRET_KEY"):
+        return os.environ["SECRET_KEY"]
+    # Store on persistent volume so it survives redeploys
+    key_file = Path(os.environ.get("RUNS_DB", "/data/scraper.db")).parent / ".secret_key"
+    try:
+        if key_file.exists():
+            return key_file.read_text().strip()
+        key = uuid4().hex + uuid4().hex
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(key)
+        return key
+    except Exception:
+        return uuid4().hex + uuid4().hex
+
+app.secret_key = _get_secret_key()
 
 # ── Authentication ───────────────────────────────────────────────────
 
