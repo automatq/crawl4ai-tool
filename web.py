@@ -64,8 +64,12 @@ def unauthorized():
 
 @app.before_request
 def require_login():
+    # Allow public endpoints by name
     public_endpoints = {"login_page", "api_login", "api_signup", "health", "static"}
     if request.endpoint and request.endpoint in public_endpoints:
+        return None
+    # Allow static files and login page by path
+    if request.path.startswith("/static/") or request.path == "/login":
         return None
     if not current_user.is_authenticated:
         if request.path.startswith("/api/"):
