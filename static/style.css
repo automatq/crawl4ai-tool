@@ -81,6 +81,27 @@ body {
   font-family: 'SF Mono', 'Fira Code', monospace;
 }
 
+.user-info {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.btn-outline:hover {
+  background: var(--bg-body);
+  color: var(--text-primary);
+}
+
 /* ── Badges ───────────────────────────────────────────────────────── */
 
 .badge {

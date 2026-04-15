@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -18,7 +19,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 from gmaps import scrape_google_maps, scrape_google_maps_area
@@ -27,6 +30,47 @@ from outreach import run_outreach
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
+app.secret_key = os.environ.get("SECRET_KEY", uuid4().hex + uuid4().hex)
+
+# ── Authentication ───────────────────────────────────────────────────
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login_page"
+
+
+class User(UserMixin):
+    def __init__(self, id, username):
+        self.id = id
+        self.username = username
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = _get_runs_db()
+    row = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return User(row["id"], row["username"])
+    return None
+
+
+@login_manager.unauthorized_handler
+def unauthorized():
+    if request.path.startswith("/api/"):
+        return jsonify(error="Not authenticated"), 401
+    return redirect("/login")
+
+
+@app.before_request
+def require_login():
+    public_endpoints = {"login_page", "api_login", "api_signup", "health", "static"}
+    if request.endpoint and request.endpoint in public_endpoints:
+        return None
+    if not current_user.is_authenticated:
+        if request.path.startswith("/api/"):
+            return jsonify(error="Not authenticated"), 401
+        return redirect("/login")
 
 
 # ── Canadian cities database ──────────────────────────────────────────
@@ -51,8 +95,15 @@ def _get_runs_db():
     """Return a sqlite3 connection to the run history database."""
     conn = sqlite3.connect(str(RUNS_DB))
     conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
+        user_id TEXT,
         mode TEXT,
         keyword TEXT,
         cities TEXT,
@@ -67,12 +118,13 @@ def _get_runs_db():
         backup_filename TEXT
     )""")
     conn.commit()
-    # Migration for existing tables missing backup_filename
-    try:
-        conn.execute("ALTER TABLE runs ADD COLUMN backup_filename TEXT")
-        conn.commit()
-    except Exception:
-        pass
+    # Migrations for existing tables
+    for col, spec in [("backup_filename", "TEXT"), ("user_id", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {spec}")
+            conn.commit()
+        except Exception:
+            pass
     return conn
 
 
@@ -84,9 +136,9 @@ def _log_run_start(job: "Job"):
     try:
         conn = _get_runs_db()
         conn.execute(
-            "INSERT INTO runs (run_id, mode, keyword, cities, status, created_at, grid_spacing_km, max_results) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (job.id, ic.get("mode", ""), ic.get("keyword", ""), cities, "running",
+            "INSERT INTO runs (run_id, user_id, mode, keyword, cities, status, created_at, grid_spacing_km, max_results) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (job.id, job.user_id, ic.get("mode", ""), ic.get("keyword", ""), cities, "running",
              time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.created_at)),
              ic.get("grid_spacing_km"), ic.get("max_results")),
         )
@@ -132,6 +184,7 @@ def _save_backup(job: "Job"):
 
         payload = {
             "job_id": job.id,
+            "user_id": job.user_id,
             "created_at": job.created_at,
             "finished_at": job.finished_at,
             "duration": round(job.duration, 1),
@@ -170,6 +223,7 @@ class Job:
     created_at: float = field(default_factory=time.time)
     finished_at: float = 0
     input_config: dict = field(default_factory=dict)
+    user_id: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str, level: str = "info"):
@@ -214,28 +268,17 @@ for _i in range(_NUM_WORKERS):
     _t.start()
 
 
-def _purge_old_backups(max_age_days=3):
-    """Delete backup JSON files older than max_age_days."""
-    cutoff = time.time() - (max_age_days * 86400)
-    for f in BACKUP_DIR.glob("*.json"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-        except Exception:
-            pass
-
-
 def _cleanup_old_jobs():
     cutoff = time.time() - 3600
     stale = [jid for jid, j in jobs.items() if j.created_at < cutoff]
     for jid in stale:
         del jobs[jid]
-    _purge_old_backups()
 
 
 def _create_job(**input_config) -> Job:
     _cleanup_old_jobs()
-    job = Job(id=uuid4().hex[:8], input_config=input_config)
+    user_id = current_user.id if current_user.is_authenticated else ""
+    job = Job(id=uuid4().hex[:8], input_config=input_config, user_id=user_id)
     jobs[job.id] = job
     return job
 
@@ -877,20 +920,88 @@ def _run_url_job(job: Job, urls: list[str]):
 
 # ── Routes ────────────────────────────────────────────────────────────
 
+@app.route("/login")
+def login_page():
+    if current_user.is_authenticated:
+        return redirect("/")
+    return render_template("login.html")
+
+
+@app.post("/api/login")
+def api_login():
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip().lower()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify(error="Username and password required"), 400
+
+    conn = _get_runs_db()
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    conn.close()
+
+    if not row or not check_password_hash(row["password_hash"], password):
+        return jsonify(error="Invalid username or password"), 401
+
+    login_user(User(row["id"], row["username"]), remember=True)
+    return jsonify(ok=True, username=row["username"])
+
+
+@app.post("/api/signup")
+def api_signup():
+    data = request.get_json(force=True)
+    username = (data.get("username") or "").strip().lower()
+    password = data.get("password") or ""
+    if not username or len(username) < 3:
+        return jsonify(error="Username must be at least 3 characters"), 400
+    if len(password) < 6:
+        return jsonify(error="Password must be at least 6 characters"), 400
+
+    user_id = uuid4().hex
+    pw_hash = generate_password_hash(password)
+    conn = _get_runs_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?,?,?,?)",
+            (user_id, username, pw_hash, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify(error="Username already taken"), 409
+    conn.close()
+
+    login_user(User(user_id, username), remember=True)
+    return jsonify(ok=True, username=username)
+
+
+@app.post("/api/logout")
+def api_logout():
+    logout_user()
+    return jsonify(ok=True)
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", username=current_user.username)
 
 
 @app.get("/health")
 def health():
     backup_count = len(list(BACKUP_DIR.glob("*.json")))
+    try:
+        usage = shutil.disk_usage("/data")
+        disk_used_mb = round(usage.used / 1024 / 1024)
+        disk_free_mb = round(usage.free / 1024 / 1024)
+    except Exception:
+        disk_used_mb = disk_free_mb = None
     return jsonify(
         status="ok",
         queue_size=_work_queue.qsize(),
         active_jobs=sum(1 for j in jobs.values() if j.status in ("searching", "scraping")),
         total_jobs=len(jobs),
         backups_on_disk=backup_count,
+        disk_used_mb=disk_used_mb,
+        disk_free_mb=disk_free_mb,
     )
 
 
@@ -1256,9 +1367,12 @@ def _get_run_leads(run_id):
 
 @app.get("/api/runs")
 def api_runs():
-    """List run history from the persistent database."""
+    """List run history for the current user."""
     conn = _get_runs_db()
-    rows = conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 100").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM runs WHERE user_id=? OR user_id IS NULL OR user_id='' ORDER BY created_at DESC LIMIT 100",
+        (current_user.id,),
+    ).fetchall()
     conn.close()
     return jsonify(runs=[dict(r) for r in rows])
 
@@ -1267,7 +1381,10 @@ def api_runs():
 def api_run_detail(run_id):
     """Return run metadata + leads (if backup still available)."""
     conn = _get_runs_db()
-    row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM runs WHERE run_id=? AND (user_id=? OR user_id IS NULL OR user_id='')",
+        (run_id, current_user.id),
+    ).fetchone()
     conn.close()
     if not row:
         return jsonify(error="Run not found"), 404

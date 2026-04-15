@@ -12,6 +12,24 @@ let startTime = null;
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
+// ── Auth helpers ────────────────────────────────────────────────────
+
+// Wrap fetch to redirect on 401
+const _origFetch = window.fetch;
+window.fetch = async function (...args) {
+  const res = await _origFetch(...args);
+  if (res.status === 401 && !window.location.pathname.startsWith("/login")) {
+    window.location.href = "/login";
+  }
+  return res;
+};
+
+// Logout button
+document.getElementById("logout-btn")?.addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" });
+  window.location.href = "/login";
+});
+
 // ── Tab navigation ───────────────────────────────────────────────────
 
 $$(".tab").forEach((tab) => {

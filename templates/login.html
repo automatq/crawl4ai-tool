@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lead Scraper — Login</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    .login-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+    .login-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-card);
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 380px;
+    }
+    .login-card h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 0.25rem;
+      text-align: center;
+    }
+    .login-card .subtitle {
+      color: var(--text-secondary);
+      text-align: center;
+      margin-bottom: 1.5rem;
+      font-size: 0.875rem;
+    }
+    .login-card .field { margin-bottom: 1rem; }
+    .login-card label {
+      display: block;
+      font-weight: 500;
+      margin-bottom: 0.25rem;
+      font-size: 0.875rem;
+    }
+    .login-card input[type="text"],
+    .login-card input[type="password"] {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 0.875rem;
+      font-family: var(--font);
+      background: var(--bg-input);
+    }
+    .login-card input:focus {
+      outline: none;
+      border-color: var(--color-primary);
+      box-shadow: 0 0 0 3px rgba(36, 109, 255, 0.12);
+    }
+    .login-card .btn-login {
+      width: 100%;
+      padding: 0.65rem;
+      background: var(--color-primary);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: var(--font);
+      margin-top: 0.5rem;
+    }
+    .login-card .btn-login:hover { background: var(--color-primary-hover); }
+    .login-card .btn-login:disabled { opacity: 0.6; cursor: not-allowed; }
+    .login-card .error-msg {
+      background: #fef2f2;
+      color: var(--color-error);
+      border: 1px solid #fecaca;
+      border-radius: var(--radius-sm);
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 1rem;
+      font-size: 0.8125rem;
+      display: none;
+    }
+    .login-card .toggle-link {
+      text-align: center;
+      margin-top: 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+    .login-card .toggle-link a {
+      color: var(--color-primary);
+      text-decoration: none;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .login-card .toggle-link a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="login-wrapper">
+    <div class="login-card">
+      <h1>Lead Scraper</h1>
+      <p class="subtitle" id="form-subtitle">Sign in to your account</p>
+
+      <div class="error-msg" id="error-msg"></div>
+
+      <form id="login-form" onsubmit="return false;">
+        <div class="field">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn-login" id="submit-btn" type="submit">Log in</button>
+      </form>
+
+      <div class="toggle-link">
+        <span id="toggle-text">Don't have an account? </span>
+        <a id="toggle-btn" onclick="toggleMode()">Sign up</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let isSignup = false;
+
+    function toggleMode() {
+      isSignup = !isSignup;
+      document.getElementById("submit-btn").textContent = isSignup ? "Create account" : "Log in";
+      document.getElementById("form-subtitle").textContent = isSignup
+        ? "Create a new account" : "Sign in to your account";
+      document.getElementById("toggle-text").textContent = isSignup
+        ? "Already have an account? " : "Don't have an account? ";
+      document.getElementById("toggle-btn").textContent = isSignup ? "Log in" : "Sign up";
+      document.getElementById("password").autocomplete = isSignup ? "new-password" : "current-password";
+      document.getElementById("error-msg").style.display = "none";
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async () => {
+      const username = document.getElementById("username").value.trim();
+      const password = document.getElementById("password").value;
+      const errEl = document.getElementById("error-msg");
+      const btn = document.getElementById("submit-btn");
+
+      if (!username || !password) return;
+
+      btn.disabled = true;
+      errEl.style.display = "none";
+
+      try {
+        const endpoint = isSignup ? "/api/signup" : "/api/login";
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          errEl.textContent = data.error || "Something went wrong";
+          errEl.style.display = "block";
+          btn.disabled = false;
+          return;
+        }
+
+        window.location.href = "/";
+      } catch (e) {
+        errEl.textContent = "Connection error. Please try again.";
+        errEl.style.display = "block";
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
