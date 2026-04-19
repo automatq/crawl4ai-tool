@@ -898,18 +898,12 @@ async def _scrape_detail_page(
     rate_limiter: DomainRateLimiter,
 ) -> dict:
     """Visit an individual Maps listing and extract full details."""
-    # Wait for the phone button or address button to render — these are
-    # dynamically loaded by Google Maps JS and indicate the detail sidebar
-    # is fully populated.  Falls back to a generous delay if neither appears.
     config = CrawlerRunConfig(
         word_count_threshold=0,
         remove_overlay_elements=True,
         wait_until="domcontentloaded",
-        wait_for='js:!!document.querySelector(\'button[data-item-id^="phone:"]\')'
-                  ' || !!document.querySelector(\'button[data-item-id="address"]\')',
-        page_timeout=15000,
         js_code=CONSENT_JS + "\n" + EXTRACT_DETAIL_JS,
-        delay_before_return_html=3.0,
+        delay_before_return_html=3.5,
     )
 
     await asyncio.sleep(random.uniform(2.0, 4.0))
@@ -921,11 +915,15 @@ async def _scrape_detail_page(
     )
 
     if not result.success:
+        log.warning(f"Detail page failed for {maps_url}: {err or 'unknown error'}")
         return {}
 
     html = str(result.html) if result.html else ""
     md = str(result.markdown) if result.markdown else ""
-    return _parse_listing_detail(html, md, maps_url)
+    detail = _parse_listing_detail(html, md, maps_url)
+    if not detail.get("phone") and not detail.get("address"):
+        log.info(f"Detail page loaded but no phone/address extracted: {maps_url}")
+    return detail
 
 
 async def _enrich_with_website(
