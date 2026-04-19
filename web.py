@@ -23,7 +23,7 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
+from scrape import scrape_all, normalize_url, ScrapeConfig
 from gmaps import scrape_google_maps, scrape_google_maps_area
 from homestars import scrape_homestars_multi_city, scrape_homestars
 from outreach import run_outreach
@@ -375,102 +375,6 @@ def _run_outreach_phase(job: Job, leads: list[dict], cfg: ScrapeConfig) -> list[
     job.log(f"Outreach complete: {summary}")
 
     return merged
-
-
-def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
-    _log_run_start(job)
-    try:
-        cfg = _make_config(job.input_config)
-
-        with job.lock:
-            job.status = "searching"
-            job.progress_msg = f"Searching for '{keyword}'..."
-        job.log(f"Starting keyword search: '{keyword}' in {', '.join(cities)}")
-        job.log(f"Target: {num} leads")
-        if cfg.stealth:
-            job.log("Stealth mode: enabled")
-        if cfg.proxies:
-            job.log(f"Proxy rotation: {len(cfg.proxies)} proxies")
-        if cfg.use_google_maps:
-            job.log("Google Maps search: enabled")
-        if cfg.crawl_depth >= 1:
-            job.log("Deep crawl: enabled (following internal links)")
-
-        def search_progress(found, target, msg):
-            if job.cancel_flag:
-                raise InterruptedError("Cancelled")
-            with job.lock:
-                job.progress_pct = min(45, int((found / max(target, 1)) * 45))
-                job.progress_msg = msg
-            job.log(msg)
-
-        urls = asyncio.run(search_leads(keyword, cities, num, on_progress=search_progress, config=cfg))
-
-        if job.cancel_flag:
-            with job.lock:
-                job.status = "cancelled"
-                job.progress_msg = "Cancelled"
-                job.finished_at = time.time()
-            job.log("Cancelled by user", "warn")
-            _log_run_finish(job)
-            return
-
-        if not urls:
-            with job.lock:
-                job.status = "done"
-                job.progress_pct = 100
-                job.progress_msg = "No business sites found."
-                job.finished_at = time.time()
-            job.log("No business sites found", "warn")
-            _log_run_finish(job)
-            return
-
-        job.log(f"Found {len(urls)} unique business URLs")
-
-        with job.lock:
-            job.status = "scraping"
-            job.progress_msg = f"Scraping {len(urls)} sites..."
-
-        def scrape_progress(i, total, msg):
-            if job.cancel_flag:
-                raise InterruptedError("Cancelled")
-            with job.lock:
-                pct = 45 + int((i / max(total, 1)) * 35) if job.input_config.get("outreach_enabled") else 45 + int((i / max(total, 1)) * 55)
-                job.progress_pct = pct
-                job.progress_msg = msg
-            job.log(msg)
-
-        leads = asyncio.run(scrape_all(urls, on_progress=scrape_progress, config=cfg))
-        job.log(f"Scraping complete: {len(leads)} leads in {job.duration:.1f}s")
-
-        # Outreach phase (if enabled)
-        leads = _run_outreach_phase(job, leads, cfg)
-
-        with job.lock:
-            job.status = "done"
-            job.progress_pct = 100
-            job.results = leads
-            job.progress_msg = f"Done — {len(leads)} leads scraped."
-            job.finished_at = time.time()
-        job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
-        _save_backup(job)
-        _log_run_finish(job)
-
-    except InterruptedError:
-        with job.lock:
-            job.status = "cancelled"
-            job.progress_msg = "Cancelled by user."
-            job.finished_at = time.time()
-        job.log("Cancelled by user", "warn")
-        _log_run_finish(job)
-    except Exception as e:
-        with job.lock:
-            job.status = "error"
-            job.error = str(e)
-            job.progress_msg = f"Error: {e}"
-            job.finished_at = time.time()
-        job.log(f"Error: {e}", "error")
-        _log_run_finish(job)
 
 
 def _map_source_record(rec: dict) -> dict:
@@ -1061,32 +965,6 @@ def api_cities():
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return jsonify(cities=[dict(r) for r in rows])
-
-
-@app.post("/api/search")
-def api_search():
-    data = request.get_json(force=True)
-    keyword = data.get("keyword", "").strip()
-    cities_raw = data.get("cities", "").strip()
-    num = int(data.get("num", 50))
-
-    if not keyword:
-        return jsonify(error="Keyword is required"), 400
-    if not cities_raw:
-        return jsonify(error="At least one city is required"), 400
-
-    cities = [c.strip() for c in cities_raw.split(",") if c.strip()]
-    job = _create_job(
-        mode="keyword", keyword=keyword, cities=cities, num=num,
-        stealth=data.get("stealth", True),
-        google_maps=data.get("google_maps", False),
-        deep_crawl=data.get("deep_crawl", False),
-        proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", 3)),
-    )
-
-    _work_queue.put((_run_keyword_job, (job, keyword, cities, num)))
-    return jsonify(job_id=job.id)
 
 
 @app.post("/api/maps")

@@ -1,7 +1,7 @@
 // Lead Scraper — Apify-inspired frontend
 
 let currentJobId = null;
-let currentMode = "keyword";
+let currentMode = "maps";
 let leads = [];
 let sortCol = null;
 let sortAsc = true;
@@ -58,7 +58,6 @@ $$(".mode-btn").forEach((btn) => {
     $$(".mode-btn").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     currentMode = btn.dataset.mode;
-    $("#keyword-fields").hidden = currentMode !== "keyword";
     $("#maps-fields").hidden = currentMode !== "maps";
     $("#homestars-fields").hidden = currentMode !== "homestars";
     $("#url-fields").hidden = currentMode !== "url";
@@ -313,17 +312,7 @@ $("#start-btn").addEventListener("click", async () => {
     message_template: $("#message-template").value.trim(),
   };
 
-  if (currentMode === "keyword") {
-    const keyword = $("#keyword").value.trim();
-    const cities = $("#cities").value.trim();
-    const num = parseInt($("#num-results").value) || 50;
-    if (!keyword || !cities) {
-      showToast("Enter a keyword and at least one city", "warn");
-      return;
-    }
-    endpoint = "/api/search";
-    payload = { keyword, cities, num, ...advancedOpts };
-  } else if (currentMode === "maps") {
+  if (currentMode === "maps") {
     const keyword = $("#maps-keyword").value.trim();
     const maxResults = parseInt($("#maps-max").value) || 500;
     const enrich = $("#maps-enrich").checked;

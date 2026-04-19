@@ -39,34 +39,14 @@
     <section id="panel-input" class="panel">
 
       <div class="input-mode-toggle">
-        <button class="mode-btn active" data-mode="keyword">Keyword Search</button>
-        <button class="mode-btn" data-mode="maps">Google Maps</button>
+        <button class="mode-btn active" data-mode="maps">Google Maps</button>
         <button class="mode-btn" data-mode="homestars">HomeStars</button>
         <button class="mode-btn" data-mode="url">Direct URL</button>
         <button class="mode-btn" data-mode="import">Import File</button>
       </div>
 
-      <!-- Keyword form -->
-      <div id="keyword-fields" class="form-section">
-        <div class="field">
-          <label for="keyword">Business keyword</label>
-          <input type="text" id="keyword" placeholder='e.g. "hvac", "dentist", "plumber"'>
-          <small>The type of business to search for</small>
-        </div>
-        <div class="field">
-          <label for="cities">Cities</label>
-          <input type="text" id="cities" placeholder='e.g. "Denver, Phoenix, Dallas"'>
-          <small>Comma-separated list of cities to search in</small>
-        </div>
-        <div class="field field-sm">
-          <label for="num-results">Max leads</label>
-          <input type="number" id="num-results" value="50" min="1" max="500">
-          <small>Maximum number of leads to collect</small>
-        </div>
-      </div>
-
       <!-- Google Maps form -->
-      <div id="maps-fields" class="form-section" hidden>
+      <div id="maps-fields" class="form-section">
         <div class="field">
           <label for="maps-keyword">Keyword</label>
           <input type="text" id="maps-keyword" placeholder='e.g. "plumber Toronto", "dentist near me", "restaurant"'>
