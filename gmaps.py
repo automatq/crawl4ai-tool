@@ -910,7 +910,7 @@ async def _scrape_detail_page(
 
     result, err = await _crawl_with_retry(
         crawler, maps_url, config,
-        max_retries=2, timeout=30,
+        max_retries=3, timeout=30,
         rate_limiter=rate_limiter,
     )
 
@@ -995,7 +995,7 @@ async def scrape_google_maps(
     """
     config = config or ScrapeConfig()
     browser_config = _make_maps_browser_config(config)
-    rate_limiter = DomainRateLimiter(min_delay=3.0)
+    rate_limiter = DomainRateLimiter(min_delay=5.0)
 
     max_results = min(max_results, 120)
 
@@ -1280,7 +1280,7 @@ async def scrape_google_maps_area(
     """
     config = config or ScrapeConfig()
     browser_config = _make_maps_browser_config(config)
-    rate_limiter = DomainRateLimiter(min_delay=3.0)
+    rate_limiter = DomainRateLimiter(min_delay=5.0)
 
     def progress(current, total, msg):
         if on_progress:
