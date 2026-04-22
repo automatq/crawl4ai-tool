@@ -189,6 +189,96 @@ def _log_run_finish(job: "Job"):
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/data/backups"))
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
+CHECKPOINT_DIR = Path(os.environ.get("CHECKPOINT_DIR", "/data/checkpoints"))
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _checkpoint_paths(job_id: str) -> tuple[Path, Path]:
+    return CHECKPOINT_DIR / f"{job_id}.jsonl", CHECKPOINT_DIR / f"{job_id}_meta.json"
+
+
+def _checkpoint_init(job: "Job"):
+    """Write meta file so a resume can recreate the job config."""
+    try:
+        _, meta_path = _checkpoint_paths(job.id)
+        meta_path.write_text(json.dumps({
+            "job_id": job.id,
+            "user_id": job.user_id,
+            "created_at": job.created_at,
+            "input_config": job.input_config,
+        }, default=str))
+    except Exception as e:
+        job.log(f"Checkpoint init failed: {e}", "warn")
+
+
+def _checkpoint_append(job: "Job", lead: dict):
+    """Append a single lead to the per-job checkpoint file."""
+    try:
+        data_path, _ = _checkpoint_paths(job.id)
+        with data_path.open("a") as f:
+            f.write(json.dumps(lead, default=str) + "\n")
+    except Exception as e:
+        job.log(f"Checkpoint append failed: {e}", "warn")
+
+
+def _checkpoint_load(job_id: str) -> list[dict]:
+    """Read all checkpointed leads for a job."""
+    data_path, _ = _checkpoint_paths(job_id)
+    if not data_path.exists():
+        return []
+    leads = []
+    for line in data_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            leads.append(json.loads(line))
+        except Exception:
+            continue
+    return leads
+
+
+def _checkpoint_load_meta(job_id: str) -> dict | None:
+    _, meta_path = _checkpoint_paths(job_id)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return None
+
+
+def _checkpoint_clear(job_id: str):
+    """Delete checkpoint files after a successful final backup."""
+    for p in _checkpoint_paths(job_id):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _lead_maps_url(lead: dict) -> str:
+    return lead.get("l_maps") or lead.get("maps_url") or ""
+
+
+def _merge_prior_leads(new_leads: list[dict], prior_job_id: str) -> list[dict]:
+    """Merge leads from a prior (cancelled/errored) job's checkpoint into a resumed job's result set.
+
+    Deduplicates by (company, maps_url). Clears the prior checkpoint after successful merge.
+    """
+    prior = _checkpoint_load(prior_job_id)
+    if not prior:
+        return new_leads
+    seen = {(l.get("company"), _lead_maps_url(l)) for l in new_leads}
+    merged = list(new_leads)
+    for pl in prior:
+        key = (pl.get("company"), _lead_maps_url(pl))
+        if key not in seen:
+            merged.append(pl)
+            seen.add(key)
+    _checkpoint_clear(prior_job_id)
+    return merged
+
 
 def _save_backup(job: "Job"):
     """Save completed job results to the persistent volume."""
@@ -305,10 +395,27 @@ def _create_job(**input_config) -> Job:
 
 # ── Background workers ────────────────────────────────────────────────
 
+def _normalize_proxy(line: str) -> str:
+    """Accept Webshare-style host:port:user:pass and convert to a URL."""
+    line = line.strip()
+    if not line or "://" in line:
+        return line
+    parts = line.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+    if len(parts) == 2:
+        return f"http://{line}"
+    return line
+
+
 def _make_config(input_config: dict) -> ScrapeConfig:
     """Build a ScrapeConfig from the job's input config."""
     proxies_raw = input_config.get("proxies", "").strip()
-    proxies = [p.strip() for p in proxies_raw.split("\n") if p.strip()] if proxies_raw else []
+    proxies = (
+        [_normalize_proxy(p) for p in proxies_raw.split("\n") if p.strip()]
+        if proxies_raw else []
+    )
     return ScrapeConfig(
         proxies=proxies,
         stealth=input_config.get("stealth", True),
@@ -514,6 +621,12 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
         area_search = ic.get("area_search", False)
         polygon = ic.get("polygon")
 
+        _checkpoint_init(job)
+        skip_maps_urls = set(ic.get("skip_maps_urls") or [])
+        prior_job_id = ic.get("resume_from_job_id")
+
+        on_lead_cb = lambda lead: _checkpoint_append(job, lead)
+
         with job.lock:
             job.status = "searching"
             job.progress_msg = f"Searching Google Maps for '{query}'..."
@@ -528,6 +641,8 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
             job.log(f"Proxy rotation: {len(cfg.proxies)} proxies")
         if enrich:
             job.log("Website enrichment: enabled (emails/socials)")
+        if prior_job_id:
+            job.log(f"Resuming from job {prior_job_id}: skipping {len(skip_maps_urls)} already-captured listings", "info")
 
         def maps_progress(current, total, msg):
             if job.cancel_flag:
@@ -549,6 +664,8 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
                 enrich_websites=enrich,
                 config=cfg,
                 on_progress=maps_progress,
+                on_lead=on_lead_cb,
+                skip_maps_urls=skip_maps_urls,
             ))
         else:
             leads = asyncio.run(scrape_google_maps(
@@ -557,7 +674,13 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
                 enrich_websites=enrich,
                 config=cfg,
                 on_progress=maps_progress,
+                on_lead=on_lead_cb,
+                skip_maps_urls=skip_maps_urls,
             ))
+
+        if prior_job_id:
+            leads = _merge_prior_leads(leads, prior_job_id)
+            job.log(f"Merged with prior leads: {len(leads)} total after resume")
 
         with job.lock:
             job.status = "done"
@@ -574,6 +697,7 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
 
         job.log(f"Completed: {len(leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _checkpoint_clear(job.id)
         _log_run_finish(job)
 
     except InterruptedError:
@@ -599,6 +723,13 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
     _log_run_start(job)
     try:
         cfg = _make_config(job.input_config)
+        ic = job.input_config
+
+        _checkpoint_init(job)
+        skip_maps_urls = set(ic.get("skip_maps_urls") or [])
+        prior_job_id = ic.get("resume_from_job_id")
+
+        on_lead_cb = lambda lead: _checkpoint_append(job, lead)
 
         # Fetch city metadata + polygons from DB
         conn = _get_cities_db()
@@ -625,6 +756,8 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
             job.log("Stealth mode: enabled")
         if enrich:
             job.log("Website enrichment: enabled")
+        if prior_job_id:
+            job.log(f"Resuming from job {prior_job_id}: skipping {len(skip_maps_urls)} already-captured listings")
 
         for city_i, city_row in enumerate(cities):
             if job.cancel_flag:
@@ -657,6 +790,8 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
                 enrich_websites=enrich,
                 config=cfg,
                 on_progress=maps_progress,
+                on_lead=on_lead_cb,
+                skip_maps_urls=skip_maps_urls,
             ))
 
             # Deduplicate across cities by place_id
@@ -671,6 +806,10 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
 
             job.log(f"Found {len(city_leads)} leads in {city_name} "
                     f"({len(all_leads)} total unique)")
+
+        if prior_job_id:
+            all_leads = _merge_prior_leads(all_leads, prior_job_id)
+            job.log(f"Merged with prior leads: {len(all_leads)} total after resume")
 
         with job.lock:
             job.status = "done"
@@ -687,6 +826,7 @@ def _run_multi_city_maps_job(job: Job, keyword: str, city_ids: list[int],
 
         job.log(f"Completed: {len(all_leads)} leads in {job.duration:.1f}s")
         _save_backup(job)
+        _checkpoint_clear(job.id)
         _log_run_finish(job)
 
     except InterruptedError:
@@ -1369,6 +1509,53 @@ def api_cancel(job_id):
         return jsonify(error="Job not found"), 404
     job.cancel_flag = True
     return jsonify(ok=True)
+
+
+@app.post("/api/resume/<job_id>")
+def api_resume(job_id):
+    """Resume a cancelled/errored Maps job from its checkpoint."""
+    meta = _checkpoint_load_meta(job_id)
+    if not meta:
+        return jsonify(error="No resumable checkpoint found for this run"), 404
+
+    owner_id = meta.get("user_id") or ""
+    if owner_id and owner_id != current_user.id:
+        return jsonify(error="Not authorized to resume this run"), 403
+
+    old_cfg = dict(meta.get("input_config") or {})
+    prior_leads = _checkpoint_load(job_id)
+    skip_urls = [_lead_maps_url(l) for l in prior_leads if _lead_maps_url(l)]
+
+    mode = old_cfg.get("mode")
+    if mode not in ("maps", "maps_multi_city"):
+        return jsonify(error=f"Resume not supported for mode '{mode}'"), 400
+
+    new_cfg = {
+        **old_cfg,
+        "resume_from_job_id": job_id,
+        "skip_maps_urls": skip_urls,
+    }
+
+    job = _create_job(**new_cfg)
+
+    if mode == "maps_multi_city":
+        _work_queue.put((_run_multi_city_maps_job, (
+            job,
+            old_cfg.get("keyword", ""),
+            old_cfg.get("city_ids", []),
+            int(old_cfg.get("max_results", 500)),
+            float(old_cfg.get("grid_spacing_km", 1.0)),
+            bool(old_cfg.get("enrich_websites", False)),
+        )))
+    else:
+        _work_queue.put((_run_maps_job, (
+            job,
+            old_cfg.get("query", "") or old_cfg.get("keyword", ""),
+            int(old_cfg.get("max_results", 100)),
+            bool(old_cfg.get("enrich_websites", False)),
+        )))
+
+    return jsonify(job_id=job.id, resumed_from=job_id, prior_leads=len(prior_leads))
 
 
 # ── Main ──────────────────────────────────────────────────────────────

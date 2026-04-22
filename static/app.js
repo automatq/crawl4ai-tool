@@ -794,6 +794,37 @@ function statusIcon(status) {
   return '<span class="status-icon status-neutral">&mdash;</span>';
 }
 
+async function resumeRun(runId, btn) {
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = "Resuming...";
+  try {
+    const resp = await fetch(`/api/resume/${runId}`, { method: "POST" });
+    const data = await resp.json();
+    if (data.error) {
+      showToast(data.error, "error");
+      btn.disabled = false;
+      btn.textContent = origText;
+      return;
+    }
+    showToast(`Resumed — ${data.prior_leads} prior leads kept`, "success");
+    // Switch to the run tab and attach to the new job's SSE stream
+    switchTab("run");
+    currentJobId = data.job_id;
+    $("#run-id").hidden = false;
+    $("#run-id-value").textContent = data.job_id;
+    $("#cancel-btn").hidden = false;
+    startTime = Date.now();
+    startDurationTimer();
+    setStatus("running");
+    connectSSE(currentJobId);
+  } catch (err) {
+    showToast("Resume failed: " + err.message, "error");
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
 async function loadRunHistory() {
   try {
     const resp = await fetch("/api/runs");
@@ -817,8 +848,13 @@ async function loadRunHistory() {
         const arr = JSON.parse(cities);
         if (Array.isArray(arr)) cities = `${arr.length} cities`;
       } catch {}
+      const canResume = (r.status === "cancelled" || r.status === "error")
+        && (r.mode === "maps" || r.mode === "maps_multi_city");
+      const resumeBtn = canResume
+        ? ` <button class="btn btn-sm btn-outline btn-resume" data-resume-id="${esc(r.run_id)}" title="Resume from checkpoint">Resume</button>`
+        : "";
       return `<tr data-run-id="${esc(r.run_id)}" class="history-row-clickable">
-        <td>${statusIcon(r.status)} ${statusBadge(r.status)}</td>
+        <td>${statusIcon(r.status)} ${statusBadge(r.status)}${resumeBtn}</td>
         <td>${esc(r.mode || "—")}</td>
         <td>${esc(r.keyword || "—")}</td>
         <td>${esc(cities)}</td>
@@ -830,6 +866,12 @@ async function loadRunHistory() {
 
     body.querySelectorAll("tr[data-run-id]").forEach(tr => {
       tr.addEventListener("click", () => showRunDetail(tr.dataset.runId));
+    });
+    body.querySelectorAll(".btn-resume").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        resumeRun(btn.dataset.resumeId, btn);
+      });
     });
   } catch (err) {
     console.error("Failed to load run history:", err);

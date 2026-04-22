@@ -980,6 +980,8 @@ async def scrape_google_maps(
     enrich_websites: bool = False,
     config: ScrapeConfig | None = None,
     on_progress: Callable | None = None,
+    on_lead: Callable | None = None,
+    skip_maps_urls: set | None = None,
 ) -> list[dict]:
     """Main entry point: search Google Maps and extract business data.
 
@@ -989,6 +991,8 @@ async def scrape_google_maps(
         enrich_websites: If True, visit each business website for emails/socials
         config: Scraping configuration (proxies, stealth, etc.)
         on_progress: Callback(current, total, message)
+        on_lead: Callback(formatted_lead_dict) fired after each listing scraped.
+        skip_maps_urls: Set of maps_urls already captured (skip their detail pages).
 
     Returns:
         List of lead dicts with all extracted fields.
@@ -996,6 +1000,7 @@ async def scrape_google_maps(
     config = config or ScrapeConfig()
     browser_config = _make_maps_browser_config(config)
     rate_limiter = DomainRateLimiter(min_delay=5.0)
+    skip_maps_urls = skip_maps_urls or set()
 
     max_results = min(max_results, 120)
 
@@ -1020,6 +1025,7 @@ async def scrape_google_maps(
 
         # Phase 2: Parse listing cards from results page
         listings = _parse_listings_from_html(html)
+        listings = [l for l in listings if l.get("maps_url") not in skip_maps_urls]
         listings = listings[:max_results]
 
         if not listings:
@@ -1061,6 +1067,12 @@ async def scrape_google_maps(
                 lead.setdefault("emails", [])
                 lead.setdefault("socials", {})
 
+                if on_lead:
+                    try:
+                        on_lead(_format_one_lead(lead))
+                    except Exception as e:
+                        log.warning(f"on_lead checkpoint failed: {e}")
+
                 return lead
 
         tasks = [scrape_one(i, l) for i, l in enumerate(listings)]
@@ -1086,9 +1098,15 @@ async def scrape_google_maps(
                     async with sem:
                         progress(i, len(with_websites),
                                  f"[{i+1}/{len(with_websites)}] Enriching {lead['name']}...")
-                        return await _enrich_with_website(
+                        enriched = await _enrich_with_website(
                             lead, crawler, rate_limiter, config
                         )
+                        if on_lead:
+                            try:
+                                on_lead(_format_one_lead(enriched))
+                            except Exception as e:
+                                log.warning(f"on_lead checkpoint (enrich) failed: {e}")
+                        return enriched
 
                 enrich_tasks = [
                     enrich_one(i, l) for i, l in enumerate(with_websites)
@@ -1153,12 +1171,16 @@ async def _scrape_details_and_enrich(
     config: ScrapeConfig,
     rate_limiter: DomainRateLimiter,
     progress: Callable,
+    on_lead: Callable | None = None,
+    skip_maps_urls: set | None = None,
 ) -> list[dict]:
     """Scrape detail pages and optionally enrich with website data.
 
     Shared between scrape_google_maps() and scrape_google_maps_area().
     """
     sem = asyncio.Semaphore(max(config.concurrency, 5))
+    skip_maps_urls = skip_maps_urls or set()
+    listings = [l for l in listings if l.get("maps_url") not in skip_maps_urls]
 
     async def scrape_one(i: int, listing: dict) -> dict:
         async with sem:
@@ -1174,6 +1196,11 @@ async def _scrape_details_and_enrich(
                 ("emails", []), ("socials", {}),
             ]:
                 lead.setdefault(key, default)
+            if on_lead:
+                try:
+                    on_lead(_format_one_lead(lead))
+                except Exception as e:
+                    log.warning(f"on_lead checkpoint failed: {e}")
             return lead
 
     tasks = [scrape_one(i, l) for i, l in enumerate(listings)]
@@ -1199,7 +1226,13 @@ async def _scrape_details_and_enrich(
                 async with sem:
                     progress(i, len(with_websites),
                              f"[{i+1}/{len(with_websites)}] Enriching {lead['name']}...")
-                    return await _enrich_with_website(lead, crawler, rate_limiter, config)
+                    enriched = await _enrich_with_website(lead, crawler, rate_limiter, config)
+                    if on_lead:
+                        try:
+                            on_lead(_format_one_lead(enriched))
+                        except Exception as e:
+                            log.warning(f"on_lead checkpoint (enrich) failed: {e}")
+                    return enriched
 
             enrich_tasks = [enrich_one(i, l) for i, l in enumerate(with_websites)]
             enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
@@ -1219,38 +1252,39 @@ async def _scrape_details_and_enrich(
     return good_leads
 
 
+def _format_one_lead(lead: dict) -> dict:
+    """Rename a single lead's fields to match the app's convention."""
+    return {
+        "company": lead.get("name", ""),
+        "url": lead.get("website", ""),
+        "maps_url": lead.get("maps_url", ""),
+        "category": lead.get("category", ""),
+        "description": lead.get("description", ""),
+        "emails": lead.get("emails", []),
+        "phones": [lead["phone"]] if lead.get("phone") else [],
+        "address": lead.get("address", ""),
+        "city": lead.get("city", ""),
+        "state": lead.get("state", ""),
+        "zip_code": lead.get("zip_code", ""),
+        "hours": lead.get("hours", ""),
+        "google_rating": lead.get("rating"),
+        "google_reviews": lead.get("review_count"),
+        "review_distribution": lead.get("review_distribution", {}),
+        "price_level": lead.get("price_level", ""),
+        "latitude": lead.get("latitude"),
+        "longitude": lead.get("longitude"),
+        "place_id": lead.get("place_id", ""),
+        "plus_code": lead.get("plus_code", ""),
+        "is_temporarily_closed": lead.get("is_temporarily_closed", False),
+        "is_permanently_closed": lead.get("is_permanently_closed", False),
+        "thumbnail_url": lead.get("thumbnail_url", ""),
+        "socials": lead.get("socials", {}),
+    }
+
+
 def _format_leads(leads: list[dict]) -> list[dict]:
     """Rename fields to match the app's convention."""
-    output = []
-    for lead in leads:
-        out = {
-            "company": lead.get("name", ""),
-            "url": lead.get("website", ""),
-            "maps_url": lead.get("maps_url", ""),
-            "category": lead.get("category", ""),
-            "description": lead.get("description", ""),
-            "emails": lead.get("emails", []),
-            "phones": [lead["phone"]] if lead.get("phone") else [],
-            "address": lead.get("address", ""),
-            "city": lead.get("city", ""),
-            "state": lead.get("state", ""),
-            "zip_code": lead.get("zip_code", ""),
-            "hours": lead.get("hours", ""),
-            "google_rating": lead.get("rating"),
-            "google_reviews": lead.get("review_count"),
-            "review_distribution": lead.get("review_distribution", {}),
-            "price_level": lead.get("price_level", ""),
-            "latitude": lead.get("latitude"),
-            "longitude": lead.get("longitude"),
-            "place_id": lead.get("place_id", ""),
-            "plus_code": lead.get("plus_code", ""),
-            "is_temporarily_closed": lead.get("is_temporarily_closed", False),
-            "is_permanently_closed": lead.get("is_permanently_closed", False),
-            "thumbnail_url": lead.get("thumbnail_url", ""),
-            "socials": lead.get("socials", {}),
-        }
-        output.append(out)
-    return output
+    return [_format_one_lead(l) for l in leads]
 
 
 # ── Polygon area search ──────────────────────────────────────────────
@@ -1263,6 +1297,8 @@ async def scrape_google_maps_area(
     enrich_websites: bool = False,
     config: ScrapeConfig | None = None,
     on_progress: Callable | None = None,
+    on_lead: Callable | None = None,
+    skip_maps_urls: set | None = None,
 ) -> list[dict]:
     """Search Google Maps across a polygon grid to overcome the 120-result cap.
 
@@ -1274,6 +1310,8 @@ async def scrape_google_maps_area(
         enrich_websites: Visit business websites for emails/socials
         config: Scraping configuration
         on_progress: Callback(current, total, message)
+        on_lead: Callback(formatted_lead_dict) fired after each listing scraped.
+        skip_maps_urls: Set of maps_urls already captured (skip their detail pages).
 
     Returns:
         List of lead dicts (same format as scrape_google_maps).
@@ -1281,6 +1319,7 @@ async def scrape_google_maps_area(
     config = config or ScrapeConfig()
     browser_config = _make_maps_browser_config(config)
     rate_limiter = DomainRateLimiter(min_delay=5.0)
+    skip_maps_urls = skip_maps_urls or set()
 
     def progress(current, total, msg):
         if on_progress:
@@ -1402,6 +1441,14 @@ async def scrape_google_maps_area(
     progress(total_cells, total_cells,
              f"Grid search complete: {len(all_listings)} unique listings from {total_cells} cells")
 
+    if skip_maps_urls:
+        before = len(all_listings)
+        all_listings = [l for l in all_listings if l.get("maps_url") not in skip_maps_urls]
+        skipped = before - len(all_listings)
+        if skipped:
+            progress(total_cells, total_cells,
+                     f"Resume: skipping {skipped} already-captured listings ({len(all_listings)} remaining)")
+
     if not all_listings:
         progress(0, 0, "No listings found in polygon area")
         return []
@@ -1411,6 +1458,8 @@ async def scrape_google_maps_area(
         good_leads = await _scrape_details_and_enrich(
             detail_crawler, all_listings, max_results, enrich_websites,
             config, rate_limiter, progress,
+            on_lead=on_lead,
+            skip_maps_urls=skip_maps_urls,
         )
 
     # Phase 3: Post-filter by polygon boundary
