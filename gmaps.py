@@ -15,6 +15,7 @@ import logging
 import math
 import random
 import re
+import threading
 import time
 from typing import Callable
 from urllib.parse import quote_plus, urlparse
@@ -38,8 +39,12 @@ logging.basicConfig(level=logging.INFO)
 
 # ── Browser config for Maps (needs full DOM, not text-only) ──────────
 
-def _make_maps_browser_config(config: ScrapeConfig) -> BrowserConfig:
-    """Maps needs full rendering — no text_mode or light_mode."""
+def _make_maps_browser_config(config: ScrapeConfig, proxy: str | None = None) -> BrowserConfig:
+    """Maps needs full rendering — no text_mode or light_mode.
+
+    If `proxy` is given, use it explicitly; otherwise fall back to
+    `config.proxies[0]` (unused 9 is why ProxyPool exists).
+    """
     kwargs = dict(
         headless=True,
         enable_stealth=config.stealth,
@@ -52,9 +57,100 @@ def _make_maps_browser_config(config: ScrapeConfig) -> BrowserConfig:
             "--lang=en-US",
         ],
     )
-    if config.proxies:
+    if proxy:
+        kwargs["proxy"] = proxy
+    elif config.proxies:
         kwargs["proxy"] = config.proxies[0]
     return BrowserConfig(**kwargs)
+
+
+# ── Proxy health tracker ─────────────────────────────────────────────
+
+class ProxyPool:
+    """Thread-safe round-robin proxy pool with failure tracking + cooldown.
+
+    Proxies that hit `fail_threshold` consecutive failures enter a cooldown
+    for `cooldown_seconds`, during which `get_next()` will skip them.
+    Once the cooldown passes, they're eligible again.
+    """
+
+    def __init__(self, proxies: list[str] | None,
+                 fail_threshold: int = 3, cooldown_seconds: float = 300.0):
+        self.proxies = list(proxies) if proxies else []
+        self._fail_threshold = fail_threshold
+        self._cooldown = cooldown_seconds
+        self._fail_counts: dict[str, int] = {}
+        self._cooldown_until: dict[str, float] = {}
+        self._next_idx = 0
+        self._lock = threading.Lock()
+
+    def __bool__(self) -> bool:
+        return bool(self.proxies)
+
+    def __len__(self) -> int:
+        return len(self.proxies)
+
+    def get_next(self, exclude: str | None = None) -> str | None:
+        """Round-robin the next healthy proxy. Skip cooling-down and `exclude`.
+
+        If all are cooling down, returns the one whose cooldown ends soonest.
+        Returns None only when the pool is empty.
+        """
+        if not self.proxies:
+            return None
+        with self._lock:
+            now = time.time()
+            n = len(self.proxies)
+            for _ in range(n):
+                p = self.proxies[self._next_idx % n]
+                self._next_idx = (self._next_idx + 1) % n
+                if p == exclude:
+                    continue
+                if self._cooldown_until.get(p, 0) > now:
+                    continue
+                return p
+            candidates = [p for p in self.proxies if p != exclude] or self.proxies
+            return min(candidates, key=lambda p: self._cooldown_until.get(p, 0))
+
+    def mark_failure(self, proxy: str | None):
+        if not proxy:
+            return
+        with self._lock:
+            self._fail_counts[proxy] = self._fail_counts.get(proxy, 0) + 1
+            if self._fail_counts[proxy] >= self._fail_threshold:
+                self._cooldown_until[proxy] = time.time() + self._cooldown
+                self._fail_counts[proxy] = 0
+
+    def mark_success(self, proxy: str | None):
+        if not proxy:
+            return
+        with self._lock:
+            self._fail_counts[proxy] = 0
+
+    def status(self) -> str:
+        with self._lock:
+            now = time.time()
+            healthy = sum(1 for p in self.proxies if self._cooldown_until.get(p, 0) <= now)
+            cooling = len(self.proxies) - healthy
+            return f"{healthy} healthy, {cooling} cooling of {len(self.proxies)} total"
+
+
+def _label_proxy(proxy: str | None) -> str:
+    """Short, non-sensitive label for a proxy (host:port only)."""
+    if not proxy:
+        return "direct"
+    try:
+        u = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+        return f"{u.hostname}:{u.port}" if u.hostname else proxy
+    except Exception:
+        return proxy
+
+
+def _looks_blocked(lead: dict) -> bool:
+    """Detail page returned effectively nothing — name-only or worse."""
+    name_present = bool(lead.get("name"))
+    any_detail = any(lead.get(k) for k in ("phone", "address", "website", "hours", "latitude"))
+    return name_present and not any_detail
 
 
 # ── JavaScript snippets ──────────────────────────────────────────────
@@ -998,7 +1094,9 @@ async def scrape_google_maps(
         List of lead dicts with all extracted fields.
     """
     config = config or ScrapeConfig()
-    browser_config = _make_maps_browser_config(config)
+    proxy_pool = ProxyPool(config.proxies)
+    picked_proxy = proxy_pool.get_next() if proxy_pool else None
+    browser_config = _make_maps_browser_config(config, proxy=picked_proxy)
     rate_limiter = DomainRateLimiter(min_delay=5.0)
     skip_maps_urls = skip_maps_urls or set()
 
@@ -1173,19 +1271,39 @@ async def _scrape_details_and_enrich(
     progress: Callable,
     on_lead: Callable | None = None,
     skip_maps_urls: set | None = None,
-) -> list[dict]:
+    proxy_pool: "ProxyPool | None" = None,
+    current_proxy: str | None = None,
+    block_threshold: int = 5,
+) -> tuple[list[dict], bool]:
     """Scrape detail pages and optionally enrich with website data.
 
     Shared between scrape_google_maps() and scrape_google_maps_area().
+
+    Returns (leads, blocked). `blocked=True` signals the caller that the
+    current proxy seems blocked and should be rotated before retrying the
+    remaining listings.
     """
     sem = asyncio.Semaphore(max(config.concurrency, 5))
     skip_maps_urls = skip_maps_urls or set()
     listings = [l for l in listings if l.get("maps_url") not in skip_maps_urls]
 
-    async def scrape_one(i: int, listing: dict) -> dict:
+    consecutive_blocks = 0
+    blocked = False
+    abort = asyncio.Event()
+
+    async def scrape_one(i: int, listing: dict) -> dict | None:
+        nonlocal consecutive_blocks, blocked
+        if abort.is_set():
+            return None
         async with sem:
+            if abort.is_set():
+                return None
             progress(i, len(listings), f"[{i+1}/{len(listings)}] {listing['name']}")
-            detail = await _scrape_detail_page(crawler, listing["maps_url"], rate_limiter)
+            try:
+                detail = await _scrape_detail_page(crawler, listing["maps_url"], rate_limiter)
+            except Exception as e:
+                log.warning(f"detail scrape exception: {e}")
+                detail = {}
             lead = {**listing, **detail}
             for key, default in [
                 ("category", ""), ("address", ""), ("phone", ""), ("website", ""),
@@ -1196,6 +1314,19 @@ async def _scrape_details_and_enrich(
                 ("emails", []), ("socials", {}),
             ]:
                 lead.setdefault(key, default)
+            if _looks_blocked(lead):
+                consecutive_blocks += 1
+                if proxy_pool and consecutive_blocks >= block_threshold:
+                    blocked = True
+                    abort.set()
+                    progress(i, len(listings),
+                             f"Proxy {_label_proxy(current_proxy)} looks blocked "
+                             f"({consecutive_blocks} empty in a row) — rotating")
+                    return None
+            else:
+                consecutive_blocks = 0
+                if proxy_pool:
+                    proxy_pool.mark_success(current_proxy)
             if on_lead:
                 try:
                     on_lead(_format_one_lead(lead))
@@ -1211,13 +1342,16 @@ async def _scrape_details_and_enrich(
         if isinstance(lead, Exception):
             progress(i + 1, len(listings), f"Error: {lead}")
             continue
+        if lead is None:
+            continue
         good_leads.append(lead)
 
     progress(len(good_leads), len(listings),
-             f"Scraped {len(good_leads)} listings from Maps")
+             f"Scraped {len(good_leads)} listings from Maps"
+             + (" (proxy rotation triggered)" if blocked else ""))
 
-    # Website enrichment
-    if enrich_websites:
+    # Website enrichment — skip when blocked (caller will rotate + retry)
+    if enrich_websites and not blocked:
         with_websites = [l for l in good_leads if l.get("website")]
         if with_websites:
             progress(0, len(with_websites), "Enriching with website data...")
@@ -1249,7 +1383,7 @@ async def _scrape_details_and_enrich(
             progress(len(with_websites), len(with_websites),
                      f"Enriched {len(enriched_map)} leads with website data")
 
-    return good_leads
+    return good_leads, blocked
 
 
 def _format_one_lead(lead: dict) -> dict:
@@ -1346,15 +1480,48 @@ async def scrape_google_maps_area(
     all_listings: list[dict] = []
     cells_done = [0]  # mutable counter for progress across workers
 
+    grid_proxy_pool = ProxyPool(config.proxies)
+
     async def grid_worker(worker_id: int, points: list[dict]):
-        """Process a subset of grid cells in its own browser instance."""
+        """Process a subset of grid cells in its own browser instance.
+
+        Claims a proxy from the shared pool at startup and rotates to a new
+        one after consecutive empty cells or a browser crash (block signal).
+        """
         # Stagger startup so browsers don't all launch at once
         if worker_id > 0:
             await asyncio.sleep(worker_id * 3)
 
-        worker_browser = _make_maps_browser_config(config)
+        current_proxy = grid_proxy_pool.get_next() if grid_proxy_pool else None
         worker_rate_limiter = DomainRateLimiter(min_delay=2.0)
         crawler = None
+        consecutive_empty = 0
+        EMPTY_THRESHOLD = 2  # empty cells in a row → rotate proxy
+
+        async def close_crawler():
+            nonlocal crawler
+            if crawler:
+                try:
+                    await crawler.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                crawler = None
+
+        async def rotate_proxy(reason: str):
+            nonlocal current_proxy, consecutive_empty
+            if not grid_proxy_pool:
+                return False
+            grid_proxy_pool.mark_failure(current_proxy)
+            new_proxy = grid_proxy_pool.get_next(exclude=current_proxy)
+            if not new_proxy or new_proxy == current_proxy:
+                log.warning(f"[W{worker_id+1}] No other healthy proxies ({reason})")
+                return False
+            log.info(f"[W{worker_id+1}] Rotating proxy {_label_proxy(current_proxy)} "
+                     f"→ {_label_proxy(new_proxy)} ({reason})")
+            current_proxy = new_proxy
+            consecutive_empty = 0
+            await close_crawler()
+            return True
 
         try:
             for local_i, point in enumerate(points):
@@ -1368,14 +1535,16 @@ async def scrape_google_maps_area(
 
                 cells_done[0] += 1
                 progress(cells_done[0], total_cells,
-                         f"[W{worker_id+1}] Cell {cells_done[0]}/{total_cells}: "
+                         f"[W{worker_id+1}] Cell {cells_done[0]}/{total_cells} "
+                         f"(proxy {_label_proxy(current_proxy)}): "
                          f"@ {point['lat']:.4f},{point['lng']:.4f}")
 
-                # (Re)create browser if needed (first run or after crash)
+                # (Re)create browser if needed (first run or after crash/rotation)
                 if crawler is None:
+                    worker_browser = _make_maps_browser_config(config, proxy=current_proxy)
                     crawler = AsyncWebCrawler(config=worker_browser)
                     await crawler.__aenter__()
-                    log.info(f"[W{worker_id+1}] Browser started")
+                    log.info(f"[W{worker_id+1}] Browser started on proxy {_label_proxy(current_proxy)}")
 
                 try:
                     html = await _scroll_and_collect(
@@ -1383,18 +1552,15 @@ async def scrape_google_maps_area(
                         rate_limiter=worker_rate_limiter,
                     )
                 except Exception as e:
-                    log.warning(f"[W{worker_id+1}] Browser error: {e}, restarting...")
-                    try:
-                        await crawler.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                    crawler = None
-                    await asyncio.sleep(5)  # cooldown before restart
-                    continue  # skip this cell, move to next
+                    log.warning(f"[W{worker_id+1}] Browser error on proxy "
+                                f"{_label_proxy(current_proxy)}: {e}")
+                    await rotate_proxy(f"browser error: {e}")
+                    await asyncio.sleep(5)
+                    continue
 
+                cell_new_count = 0
                 if html:
                     cell_listings = _parse_listings_from_html(html)
-                    new_count = 0
                     for listing in cell_listings:
                         pid = listing.get("place_id", "")
                         url_key = listing["maps_url"].split("?")[0].split("!")[0]
@@ -1408,24 +1574,29 @@ async def scrape_google_maps_area(
                             seen_place_ids.add(pid)
                         seen_urls.add(url_key)
                         all_listings.append(listing)
-                        new_count += 1
+                        cell_new_count += 1
 
                         if len(all_listings) >= max_results:
                             break
 
-                    if new_count:
+                    if cell_new_count:
                         progress(cells_done[0], total_cells,
-                                 f"[W{worker_id+1}] +{new_count} new ({len(all_listings)} unique total)")
+                                 f"[W{worker_id+1}] +{cell_new_count} new ({len(all_listings)} unique total)")
+
+                if cell_new_count > 0:
+                    consecutive_empty = 0
+                    if grid_proxy_pool:
+                        grid_proxy_pool.mark_success(current_proxy)
+                else:
+                    consecutive_empty += 1
+                    if consecutive_empty >= EMPTY_THRESHOLD:
+                        await rotate_proxy(f"{consecutive_empty} empty cells in a row")
 
                 # Delay between cells within this worker
                 if local_i < len(points) - 1:
                     await asyncio.sleep(random.uniform(2, 4))
         finally:
-            if crawler:
-                try:
-                    await crawler.__aexit__(None, None, None)
-                except Exception:
-                    pass
+            await close_crawler()
 
     # Interleave grid points across workers (round-robin)
     # so nearby cells go to different workers
@@ -1453,14 +1624,53 @@ async def scrape_google_maps_area(
         progress(0, 0, "No listings found in polygon area")
         return []
 
-    # Phase 2: Scrape detail pages + enrichment (with own browser)
-    async with AsyncWebCrawler(config=browser_config) as detail_crawler:
-        good_leads = await _scrape_details_and_enrich(
-            detail_crawler, all_listings, max_results, enrich_websites,
-            config, rate_limiter, progress,
-            on_lead=on_lead,
-            skip_maps_urls=skip_maps_urls,
-        )
+    # Phase 2: Scrape detail pages + enrichment (rotate proxy on block detection)
+    proxy_pool = ProxyPool(config.proxies)
+    seen_urls = set(skip_maps_urls)
+    good_leads: list[dict] = []
+    current_proxy = proxy_pool.get_next() if proxy_pool else None
+    max_rotations = max(len(proxy_pool) * 2, 3)
+
+    for attempt in range(max_rotations):
+        remaining = [l for l in all_listings if l.get("maps_url") not in seen_urls]
+        if not remaining:
+            break
+        if proxy_pool:
+            progress(0, 0, f"Detail phase: proxy {_label_proxy(current_proxy)} "
+                          f"({proxy_pool.status()}), {len(remaining)} listings remaining")
+        detail_bc = _make_maps_browser_config(config, proxy=current_proxy)
+        blocked = False
+        try:
+            async with AsyncWebCrawler(config=detail_bc) as detail_crawler:
+                batch, blocked = await _scrape_details_and_enrich(
+                    detail_crawler, remaining,
+                    max_results - len(good_leads),
+                    enrich_websites,
+                    config, rate_limiter, progress,
+                    on_lead=on_lead,
+                    skip_maps_urls=seen_urls,
+                    proxy_pool=proxy_pool,
+                    current_proxy=current_proxy,
+                )
+        except Exception as e:
+            log.warning(f"Detail crawler crashed on proxy {_label_proxy(current_proxy)}: {e}")
+            batch, blocked = [], True
+        good_leads.extend(batch)
+        for l in batch:
+            if l.get("maps_url"):
+                seen_urls.add(l["maps_url"])
+        if not blocked:
+            break
+        if proxy_pool:
+            proxy_pool.mark_failure(current_proxy)
+            new_proxy = proxy_pool.get_next(exclude=current_proxy)
+            if not new_proxy or new_proxy == current_proxy:
+                progress(0, 0, "No other healthy proxies available — stopping detail phase early")
+                break
+            progress(0, 0, f"Rotating proxy: {_label_proxy(current_proxy)} → {_label_proxy(new_proxy)}")
+            current_proxy = new_proxy
+        else:
+            break
 
     # Phase 3: Post-filter by polygon boundary
     if polygon_rings:
