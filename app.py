@@ -11,6 +11,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from scrape import search_leads, scrape_all, normalize_url
+import scoring
 
 
 # ── App ───────────────────────────────────────────────────────────────
@@ -88,9 +89,11 @@ class LeadScraperApp:
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill="both", expand=True, padx=12, pady=6)
 
-        columns = ("company", "url", "emails", "phones", "address", "socials")
+        columns = ("tier", "score", "company", "url", "emails", "phones", "address", "socials")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
 
+        self.tree.heading("tier", text="Tier")
+        self.tree.heading("score", text="Score")
         self.tree.heading("company", text="Company")
         self.tree.heading("url", text="URL")
         self.tree.heading("emails", text="Emails")
@@ -98,12 +101,14 @@ class LeadScraperApp:
         self.tree.heading("address", text="Address")
         self.tree.heading("socials", text="Socials")
 
-        self.tree.column("company", width=180, minwidth=100)
-        self.tree.column("url", width=200, minwidth=120)
-        self.tree.column("emails", width=200, minwidth=100)
-        self.tree.column("phones", width=150, minwidth=80)
-        self.tree.column("address", width=180, minwidth=80)
-        self.tree.column("socials", width=180, minwidth=80)
+        self.tree.column("tier", width=60, minwidth=50)
+        self.tree.column("score", width=50, minwidth=40)
+        self.tree.column("company", width=160, minwidth=100)
+        self.tree.column("url", width=180, minwidth=120)
+        self.tree.column("emails", width=180, minwidth=100)
+        self.tree.column("phones", width=130, minwidth=80)
+        self.tree.column("address", width=160, minwidth=80)
+        self.tree.column("socials", width=160, minwidth=80)
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
@@ -233,11 +238,13 @@ class LeadScraperApp:
         self.search_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set(message)
+        leads = scoring.sort_by_score(scoring.annotate(leads))
         self.leads = leads
 
         for lead in leads:
             if "error" in lead:
                 self.tree.insert("", "end", values=(
+                    "dead", "",
                     f"ERROR: {lead.get('error', '')}",
                     lead.get("url", ""),
                     "", "", "", "",
@@ -247,6 +254,8 @@ class LeadScraperApp:
                     f"{p}: {u}" for p, u in lead.get("socials", {}).items()
                 )
                 self.tree.insert("", "end", values=(
+                    lead.get("tier", ""),
+                    lead.get("score", ""),
                     lead.get("company", ""),
                     lead.get("url", ""),
                     "; ".join(lead.get("emails", [])),
@@ -273,11 +282,16 @@ class LeadScraperApp:
         count = 0
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["company", "url", "emails", "phones", "address", "socials"])
+            w.writerow([
+                "tier", "score", "company", "url", "emails",
+                "phones", "address", "socials",
+            ])
             for lead in self.leads:
                 if "error" in lead:
                     continue
                 w.writerow([
+                    lead.get("tier", ""),
+                    lead.get("score", ""),
                     lead.get("company", ""),
                     lead.get("url", ""),
                     "; ".join(lead.get("emails", [])),

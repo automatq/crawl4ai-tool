@@ -27,6 +27,8 @@ from scrape import search_leads, scrape_all, normalize_url, ScrapeConfig
 from gmaps import scrape_google_maps, scrape_google_maps_area
 from homestars import scrape_homestars_multi_city, scrape_homestars
 from outreach import run_outreach
+import scoring
+import cache
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max upload
@@ -314,7 +316,9 @@ def _make_config(input_config: dict) -> ScrapeConfig:
         stealth=input_config.get("stealth", True),
         use_google_maps=input_config.get("google_maps", False),
         crawl_depth=1 if input_config.get("deep_crawl", False) else 0,
-        concurrency=int(input_config.get("concurrency", 5)),
+        concurrency=int(input_config.get("concurrency", 8)),
+        use_cache=input_config.get("use_cache", True),
+        enrich=input_config.get("enrich", True),
     )
 
 
@@ -446,6 +450,9 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
         # Outreach phase (if enabled)
         leads = _run_outreach_phase(job, leads, cfg)
 
+        leads = scoring.sort_by_score(scoring.annotate(leads))
+        _log_tier_summary(job, leads)
+
         with job.lock:
             job.status = "done"
             job.progress_pct = 100
@@ -471,6 +478,16 @@ def _run_keyword_job(job: Job, keyword: str, cities: list[str], num: int):
             job.finished_at = time.time()
         job.log(f"Error: {e}", "error")
         _log_run_finish(job)
+
+
+def _log_tier_summary(job: "Job", leads: list[dict]):
+    tiers: dict[str, int] = {}
+    for l in leads:
+        t = l.get("tier", "unknown")
+        tiers[t] = tiers.get(t, 0) + 1
+    if tiers:
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(tiers.items()))
+        job.log(f"Tier breakdown: {summary}")
 
 
 def _map_source_record(rec: dict) -> dict:
@@ -576,6 +593,9 @@ def _run_import_job(job: Job, records: list[dict]):
         # Outreach phase (if enabled)
         merged = _run_outreach_phase(job, merged, cfg)
 
+        merged = scoring.sort_by_score(scoring.annotate(merged))
+        _log_tier_summary(job, merged)
+
         enriched_count = sum(1 for r in merged if r.get("emails") or r.get("socials"))
         with job.lock:
             job.status = "done"
@@ -664,6 +684,10 @@ def _run_maps_job(job: Job, query: str, max_results: int, enrich: bool):
 
         # Outreach phase (if enabled)
         leads = _run_outreach_phase(job, leads, cfg)
+
+        leads = scoring.sort_by_score(scoring.annotate(leads))
+        _log_tier_summary(job, leads)
+
         with job.lock:
             job.results = leads
             job.finished_at = time.time()
@@ -859,6 +883,10 @@ def _run_homestars_job(job: Job, keyword: str, city_ids: list[int],
 
         # Outreach phase (if enabled)
         leads = _run_outreach_phase(job, leads, cfg)
+
+        leads = scoring.sort_by_score(scoring.annotate(leads))
+        _log_tier_summary(job, leads)
+
         with job.lock:
             job.results = leads
             job.finished_at = time.time()
@@ -910,6 +938,9 @@ def _run_url_job(job: Job, urls: list[str]):
 
         # Outreach phase (if enabled)
         leads = _run_outreach_phase(job, leads, cfg)
+
+        leads = scoring.sort_by_score(scoring.annotate(leads))
+        _log_tier_summary(job, leads)
 
         with job.lock:
             job.status = "done"
@@ -1014,6 +1045,10 @@ def health():
         disk_free_mb = round(usage.free / 1024 / 1024)
     except Exception:
         disk_used_mb = disk_free_mb = None
+    try:
+        cache_stats = cache.stats()
+    except Exception:
+        cache_stats = {}
     return jsonify(
         status="ok",
         queue_size=_work_queue.qsize(),
@@ -1022,6 +1057,7 @@ def health():
         backups_on_disk=backup_count,
         disk_used_mb=disk_used_mb,
         disk_free_mb=disk_free_mb,
+        **cache_stats,
     )
 
 
@@ -1082,7 +1118,9 @@ def api_search():
         google_maps=data.get("google_maps", False),
         deep_crawl=data.get("deep_crawl", False),
         proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", 3)),
+        concurrency=int(data.get("concurrency", 8)),
+        use_cache=bool(data.get("use_cache", True)),
+        enrich=bool(data.get("enrich", True)),
     )
 
     _work_queue.put((_run_keyword_job, (job, keyword, cities, num)))
@@ -1142,7 +1180,9 @@ def api_maps():
         grid_spacing_km=grid_spacing_km,
         stealth=data.get("stealth", True),
         proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", 2)),
+        concurrency=int(data.get("concurrency", 4)),
+        use_cache=bool(data.get("use_cache", True)),
+        enrich=bool(data.get("enrich", True)),
         **{k: data[k] for k in outreach_keys if k in data},
     )
 
@@ -1172,6 +1212,8 @@ def api_homestars():
         stealth=data.get("stealth", True),
         proxies=data.get("proxies", ""),
         concurrency=int(data.get("concurrency", 3)),
+        use_cache=bool(data.get("use_cache", True)),
+        enrich=bool(data.get("enrich", True)),
         **{k: data[k] for k in outreach_keys if k in data},
     )
     _work_queue.put((_run_homestars_job,
@@ -1192,7 +1234,9 @@ def api_scrape():
         stealth=data.get("stealth", True),
         deep_crawl=data.get("deep_crawl", False),
         proxies=data.get("proxies", ""),
-        concurrency=int(data.get("concurrency", 3)),
+        concurrency=int(data.get("concurrency", 8)),
+        use_cache=bool(data.get("use_cache", True)),
+        enrich=bool(data.get("enrich", True)),
     )
 
     _work_queue.put((_run_url_job, (job, urls)))
@@ -1218,7 +1262,7 @@ def api_import():
         return jsonify(error="No records provided"), 400
 
     # Default to higher concurrency for bulk imports
-    default_concurrency = min(10, max(3, len(records) // 10))
+    default_concurrency = min(12, max(4, len(records) // 10))
 
     # If raw array was sent, use defaults for config
     opts = {} if isinstance(data, list) else data
@@ -1229,6 +1273,8 @@ def api_import():
         deep_crawl=opts.get("deep_crawl", True),
         proxies=opts.get("proxies", ""),
         concurrency=int(opts.get("concurrency", default_concurrency)),
+        use_cache=bool(opts.get("use_cache", True)),
+        enrich=bool(opts.get("enrich", True)),
     )
 
     _work_queue.put((_run_import_job, (job, records)))
@@ -1295,6 +1341,7 @@ def _export_leads(leads, fmt="csv"):
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow([
+        "tier", "score",
         "url", "company", "description", "emails", "phones",
         "address", "city", "state", "zip_code", "hours", "socials",
         "category", "rating", "neighborhood",
@@ -1308,6 +1355,8 @@ def _export_leads(leads, fmt="csv"):
             continue
         is_closed = lead.get("is_temporarily_closed") or lead.get("is_permanently_closed")
         w.writerow([
+            lead.get("tier", ""),
+            lead.get("score", ""),
             lead.get("url", ""),
             lead.get("company", ""),
             lead.get("description", ""),

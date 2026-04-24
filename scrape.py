@@ -41,6 +41,10 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from crawl4ai.async_configs import ProxyConfig
 from crawl4ai.proxy_strategy import RoundRobinProxyStrategy
 
+import cache
+import scoring
+from enrichment import enrich_lead
+
 
 # ── Scraper configuration ────────────────────────────────────────────
 
@@ -53,8 +57,10 @@ class ScrapeConfig:
         stealth: bool = True,
         use_google_maps: bool = False,
         crawl_depth: int = 0,
-        concurrency: int = 3,
+        concurrency: int = 8,
         timeout: float = 30,
+        use_cache: bool = True,
+        enrich: bool = True,
     ):
         self.proxies = proxies or []
         self.stealth = stealth
@@ -62,6 +68,8 @@ class ScrapeConfig:
         self.crawl_depth = crawl_depth  # 0 = main page only, 1 = follow internal links
         self.concurrency = concurrency
         self.timeout = timeout
+        self.use_cache = use_cache  # Skip re-scraping domains hit in the last 30 days
+        self.enrich = enrich  # Run MX validation + optional Hunter.io lookup
 
     def make_browser_config(self) -> BrowserConfig:
         """Create a BrowserConfig with stealth + proxy settings."""
@@ -1151,6 +1159,8 @@ async def scrape_all(
                     rate_limiter=rate_limiter,
                     timeout=config.timeout,
                     crawl_depth=config.crawl_depth,
+                    use_cache=config.use_cache,
+                    enrich=config.enrich,
                 )
                 batch_results[idx] = lead
                 async with lock:
@@ -1187,17 +1197,28 @@ async def _scrape_sub_pages(
         exclude_external_links=False,
         remove_overlay_elements=True,
     )
-    parts = []
-    for path in SUB_PATHS:
+    async def _one(path: str) -> tuple[str, str]:
         sub_url = base + path
-        result, err = await _crawl_with_retry(
+        result, _ = await _crawl_with_retry(
             crawler, sub_url, config, max_retries=1, timeout=timeout,
             rate_limiter=rate_limiter,
         )
-        if result.success:
-            md = str(result.markdown) if result.markdown else ""
+        if result.success and result.markdown:
+            md = str(result.markdown)
             if md.strip():
-                parts.append(md)
+                return sub_url, md
+        return sub_url, ""
+
+    results = await asyncio.gather(
+        *(_one(p) for p in SUB_PATHS), return_exceptions=True,
+    )
+    parts = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        _, md = r
+        if md:
+            parts.append(md)
     return "\n".join(parts)
 
 
@@ -1281,16 +1302,22 @@ async def _deep_crawl(
         exclude_external_links=False,
         remove_overlay_elements=True,
     )
-    parts = []
-    for link_url in internal_links:
-        result, err = await _crawl_with_retry(
+
+    async def _one(link_url: str) -> str:
+        result, _ = await _crawl_with_retry(
             crawler, link_url, config, max_retries=1, timeout=timeout,
             rate_limiter=rate_limiter,
         )
-        if result.success:
-            md = str(result.markdown) if result.markdown else ""
+        if result.success and result.markdown:
+            md = str(result.markdown)
             if md.strip():
-                parts.append(md)
+                return md
+        return ""
+
+    results = await asyncio.gather(
+        *(_one(u) for u in internal_links), return_exceptions=True,
+    )
+    parts = [r for r in results if isinstance(r, str) and r]
     return "\n".join(parts)
 
 
@@ -1302,14 +1329,23 @@ async def scrape_lead(
     rate_limiter: DomainRateLimiter | None = None,
     timeout: float = 30,
     crawl_depth: int = 0,
+    use_cache: bool = True,
+    enrich: bool = True,
 ) -> dict:
     """Scrape a single URL and return structured lead data.
 
     crawl_depth:
-        0 = main page + sub-pages (/contact, /about) if no emails found
+        0 = main page + sub-pages (/contact, /about) fetched in parallel
         1 = also follow internal links to find more contact data
     """
     url = normalize_url(url)
+
+    # 1. Cache lookup — skip re-scraping recently-seen domains
+    if use_cache:
+        cached = cache.get_lead(url)
+        if cached is not None:
+            cached["cached"] = True
+            return cached
 
     config = CrawlerRunConfig(
         word_count_threshold=10,
@@ -1331,12 +1367,13 @@ async def scrape_lead(
     html = str(result.html) if result.html else ""
     md = str(result.markdown) if result.markdown else ""
 
-    # Extract emails from both markdown text and mailto: links in HTML
     mailto_text = " ".join(extract_mailto_emails(html))
     emails = extract_emails(md + " " + mailto_text)
     extra_md = ""
 
-    # Try sub-pages if no emails found on main page
+    # Only fetch sub-pages if we didn't find emails on the main page —
+    # the rate limiter serializes same-domain requests, so unconditionally
+    # fetching /contact + /about costs 4 × 2s per site.
     if not emails:
         extra_md = await _scrape_sub_pages(crawler, url, rate_limiter, timeout=10)
 
@@ -1363,7 +1400,7 @@ async def scrape_lead(
         company, address or "", crawler, rate_limiter,
     )
 
-    return {
+    lead = {
         "url": url,
         "company": company,
         "description": extract_description(md),
@@ -1376,6 +1413,21 @@ async def scrape_lead(
         "google_rating": google_data.get("google_rating"),
     }
 
+    # 3. Enrichment — MX validation + optional Hunter.io decision-maker lookup
+    if enrich:
+        lead = await enrich_lead(lead)
+
+    # 4. Score the lead so callers can sort/filter
+    score, tier = scoring.score_lead(lead)
+    lead["score"] = score
+    lead["tier"] = tier
+
+    # 5. Persist to cache so future runs skip this domain
+    if use_cache:
+        cache.put_lead(lead)
+
+    return lead
+
 
 # ── Output formatters ────────────────────────────────────────────────
 
@@ -1387,7 +1439,12 @@ def format_table(leads: list[dict]) -> str:
             lines.append(f"\n{'='*60}\n#{i}  {lead['url']}\n  ERROR: {lead['error']}")
             continue
         lines.append(f"\n{'='*60}")
-        lines.append(f"#{i}  {lead['url']}")
+        tier = lead.get("tier", "")
+        score = lead.get("score")
+        header = f"#{i}  {lead['url']}"
+        if tier:
+            header += f"   [{tier.upper()} · score={score}]"
+        lines.append(header)
         lines.append(f"  Company:     {lead['company']}")
         if lead["description"]:
             lines.append(f"  Description: {lead['description']}")
@@ -1411,9 +1468,15 @@ def format_table(leads: list[dict]) -> str:
 def write_csv(leads: list[dict], path: str):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["url", "company", "description", "emails", "phones", "address", "hours", "socials", "google_reviews", "google_rating"])
+        w.writerow([
+            "tier", "score", "url", "company", "description",
+            "emails", "phones", "address", "hours", "socials",
+            "google_reviews", "google_rating",
+        ])
         for lead in leads:
             w.writerow([
+                lead.get("tier", ""),
+                lead.get("score", ""),
                 lead.get("url", ""),
                 lead.get("company", ""),
                 lead.get("description", ""),
@@ -1516,8 +1579,18 @@ Examples:
     p.add_argument(
         "--concurrency",
         type=int,
-        default=3,
-        help="Number of concurrent scrapers (default: 3).",
+        default=8,
+        help="Number of concurrent scrapers (default: 8).",
+    )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable the 30-day domain cache — always re-scrape.",
+    )
+    p.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Disable MX validation and Hunter.io decision-maker lookup.",
     )
 
     return p.parse_args()
@@ -1539,6 +1612,8 @@ def main():
         use_google_maps=args.google_maps,
         crawl_depth=1 if args.deep else 0,
         concurrency=args.concurrency,
+        use_cache=not args.no_cache,
+        enrich=not args.no_enrich,
     )
 
     # Keyword search mode
@@ -1572,6 +1647,9 @@ def main():
         print("Run with --help for usage.", file=sys.stderr)
         sys.exit(1)
 
+    # Sort best-first by score so callers see hot leads at the top
+    leads = scoring.sort_by_score(leads)
+
     # Determine output format
     fmt = args.format
     out = args.output
@@ -1588,6 +1666,15 @@ def main():
         write_json(leads, out or "leads.json")
     else:
         print(format_table(leads))
+
+    # Summary of tier breakdown for CLI users
+    tiers = {}
+    for l in leads:
+        t = l.get("tier", "unknown")
+        tiers[t] = tiers.get(t, 0) + 1
+    if tiers:
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(tiers.items()))
+        print(f"\nTier breakdown: {summary}")
 
 
 if __name__ == "__main__":

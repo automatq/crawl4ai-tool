@@ -31,6 +31,8 @@ from scrape import (
     extract_social_links,
     extract_description,
 )
+import scoring
+from enrichment import enrich_lead
 
 log = logging.getLogger("gmaps")
 logging.basicConfig(level=logging.INFO)
@@ -1138,6 +1140,7 @@ async def scrape_google_maps(
         }
         output.append(out)
 
+    output = await _finalize_leads(output, config)
     progress(len(output), len(output),
              f"Done — {len(output)} leads from Google Maps")
     return output
@@ -1217,6 +1220,23 @@ async def _scrape_details_and_enrich(
                      f"Enriched {len(enriched_map)} leads with website data")
 
     return good_leads
+
+
+async def _finalize_leads(leads: list[dict], config: ScrapeConfig) -> list[dict]:
+    """Run enrichment + scoring on formatted leads."""
+    if config.enrich:
+        enriched = await asyncio.gather(
+            *(enrich_lead(l) for l in leads), return_exceptions=True,
+        )
+        leads = [
+            r if isinstance(r, dict) else leads[i]
+            for i, r in enumerate(enriched)
+        ]
+    for l in leads:
+        s, t = scoring.score_lead(l)
+        l["score"] = s
+        l["tier"] = t
+    return scoring.sort_by_score(leads)
 
 
 def _format_leads(leads: list[dict]) -> list[dict]:
@@ -1433,6 +1453,7 @@ async def scrape_google_maps_area(
         good_leads = filtered
 
     output = _format_leads(good_leads)
+    output = await _finalize_leads(output, config)
     progress(len(output), len(output),
              f"Done — {len(output)} leads from polygon area search")
     return output
